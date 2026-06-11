@@ -6,6 +6,9 @@ name: bootstrap-builder
 # sandbox has no outbound SSH. After this completes once, all further config
 # deploys happen via comin (GitOps pull) — see README.md.
 
+# Two triggers: workflow_dispatch for humans, and a push touching
+# bootstrap/request.json for Claude Code web sessions, whose scoped token can
+# push contents but cannot create dispatch events.
 on:
   workflow_dispatch:
     inputs:
@@ -16,6 +19,9 @@ on:
       target_ip:
         description: "Public IPv4 of the target server (root must authorize BUILDER_SSH_PRIVATE_KEY)"
         required: true
+  push:
+    branches: [main]
+    paths: ["bootstrap/request.json"]
 
 permissions:
   contents: read
@@ -26,6 +32,17 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve host and target IP
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "host=${{ inputs.host }}" >> "$GITHUB_OUTPUT"
+            echo "target_ip=${{ inputs.target_ip }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "host=$(jq -r .host bootstrap/request.json)" >> "$GITHUB_OUTPUT"
+            echo "target_ip=$(jq -r .target_ip bootstrap/request.json)" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: cachix/install-nix-action@c134e4c9e34bac6cab09cf239815f9339aaaf84e # v31.5.1
         with:
@@ -41,16 +58,16 @@ jobs:
       - name: Install NixOS with nixos-anywhere
         run: |
           nix run github:nix-community/nixos-anywhere -- \
-            --flake ".#${{ inputs.host }}" \
+            --flake ".#${{ steps.params.outputs.host }}" \
             -i ~/.ssh/builder \
             --ssh-option StrictHostKeyChecking=accept-new \
-            "root@${{ inputs.target_ip }}"
+            "root@${{ steps.params.outputs.target_ip }}"
 
       - name: Wait for reboot and verify
         run: |
           for i in $(seq 1 30); do
             if ssh -i ~/.ssh/builder -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
-                 -o ConnectTimeout=10 "root@${{ inputs.target_ip }}" \
+                 -o ConnectTimeout=10 "root@${{ steps.params.outputs.target_ip }}" \
                  'nixos-version && systemctl is-active comin && nix --version'; then
               echo "builder is up and comin is active"
               exit 0

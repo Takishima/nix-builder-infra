@@ -11,6 +11,9 @@ on:
       target_ip:
         description: "Public IPv4 of the builder"
         required: true
+  push:
+    branches: [main]
+    paths: ["checks/request.json"]
 
 permissions:
   contents: read
@@ -20,6 +23,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve target IP
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "target_ip=${{ inputs.target_ip }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "target_ip=$(jq -r .target_ip checks/request.json)" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up SSH key
         run: |
           mkdir -p ~/.ssh
@@ -31,7 +45,7 @@ jobs:
           ssh -i ~/.ssh/builder \
               -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=15 \
-              "root@${{ inputs.target_ip }}" <<'EOF'
+              "root@${{ steps.params.outputs.target_ip }}" <<'EOF'
           set -x
           hostname
           nixos-version
