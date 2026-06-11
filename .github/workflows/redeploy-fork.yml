@@ -1,0 +1,122 @@
+name: redeploy-fork
+
+# Keeps the fleet tracking the Nix branch under test, end to end: when
+# Takishima/nix's claude/single-branch-pr-split-xpy8oq branch moves, bump the
+# flake.lock nix-fork pin, prebuild the fork's nix-cli into Cachix, then push
+# the lock bump to main. comin on each builder picks that up within ~60s and
+# redeploys the cluster, substituting the prebuilt nix from the cache instead
+# of compiling for an hour on a cx33.
+#
+# Triggers:
+#   - repository_dispatch (type nix-fork-push): per-commit, sent by a tiny
+#     notifier workflow in Takishima/nix (snippet in the README). Instant.
+#   - schedule: polling fallback every 10 minutes; needs no setup in the fork
+#     repo, no-ops in seconds when the pin already matches the branch head.
+#     (GitHub disables cron on repos with no activity for 60 days.)
+#   - workflow_dispatch for humans; push touching redeploy/request.json for
+#     web sessions (whose scoped token cannot create dispatch events).
+#
+# The lock-bump commit is pushed with GITHUB_TOKEN, which GitHub never allows
+# to trigger further workflows — no recursion, and the comin pull model does
+# not depend on push events anyway.
+
+on:
+  repository_dispatch:
+    types: [nix-fork-push]
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["redeploy/request.json"]
+
+permissions:
+  contents: write
+
+# Builds take a while; serialize runs so two bumps never race on main. A run
+# queued behind a finished bump exits early at the changed=false check.
+concurrency:
+  group: redeploy-fork
+  cancel-in-progress: false
+
+env:
+  FORK_REPO: Takishima/nix
+  FORK_BRANCH: claude/single-branch-pr-split-xpy8oq
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      # Always operate on the deploy branch tip, whatever event woke us up.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Check whether the fork branch moved past the pin
+        id: head
+        run: |
+          locked=$(jq -r '.nodes."nix-fork".locked.rev' flake.lock)
+          head=$(git ls-remote "https://github.com/${FORK_REPO}.git" "refs/heads/${FORK_BRANCH}" | cut -f1)
+          if [ -z "$head" ]; then
+            echo "::error::branch ${FORK_BRANCH} not found on ${FORK_REPO}"
+            exit 1
+          fi
+          echo "locked: $locked"
+          echo "head:   $head"
+          if [ "$head" = "$locked" ]; then
+            echo "pin already at branch head; nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: cachix/install-nix-action@c134e4c9e34bac6cab09cf239815f9339aaaf84e # v31.5.1
+        if: steps.head.outputs.changed == 'true'
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Auth + cachix binary only. The result closure is pushed explicitly
+      # below, BEFORE the lock bump lands on main, so comin never sees a pin
+      # whose closure is not yet substitutable.
+      - uses: cachix/cachix-action@0fc020193b5a1fa3ac4575aa3a7d3aa6a35435ad # v16
+        if: steps.head.outputs.changed == 'true'
+        with:
+          name: ${{ vars.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
+
+      - name: Bump the nix-fork pin to the branch head
+        id: pin
+        if: steps.head.outputs.changed == 'true'
+        run: |
+          nix flake update nix-fork
+          rev=$(jq -r '.nodes."nix-fork".locked.rev' flake.lock)
+          echo "new locked nix-fork rev: $rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      # nix-cli rather than #default (nix-everything) for the same reasons as
+      # build-fork-nix.yml: it skips the functional-test suite and is the
+      # package the builders run as nix.package.
+      - name: Build the fork's nix-cli and push its closure to Cachix
+        if: steps.head.outputs.changed == 'true'
+        run: |
+          nix build "github:${FORK_REPO}/${{ steps.pin.outputs.rev }}#nix-cli" \
+            --print-build-logs --out-link result
+          ./result/bin/nix --version
+          cachix push "${{ vars.CACHIX_CACHE_NAME }}" "$(readlink -f result)"
+
+      # Only now is the new pin allowed onto the deploy branch. If the build
+      # failed above, main keeps the old, working pin.
+      - name: Push the lock bump to main (comin deploys it)
+        if: steps.head.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          short=$(echo "${{ steps.pin.outputs.rev }}" | cut -c1-12)
+          git commit -m "Bump nix-fork to ${short} (auto-redeploy)" flake.lock
+          # main may have moved during the build; the lock bump rebases cleanly
+          # over anything that did not itself touch flake.lock.
+          git pull --rebase origin main
+          git push origin main
