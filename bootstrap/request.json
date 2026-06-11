@@ -1,4 +1,5 @@
 {
   "host": "nix-builder-01",
-  "target_ip": "167.233.89.16"
+  "target_ip": "167.233.89.16",
+  "nonce": 1781186306
 }

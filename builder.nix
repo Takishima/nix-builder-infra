@@ -3,6 +3,7 @@
   pkgs,
   lib,
   self,
+  modulesPath,
   ...
 }:
 let
@@ -16,6 +17,11 @@ let
   rev = if self ? rev then self.rev else (self.dirtyRev or "unknown");
 in
 {
+  # Hetzner Cloud VMs are QEMU guests with virtio-SCSI disks; without these
+  # initrd modules the installed system hangs in stage 1, unable to find its
+  # root disk (the installer kernel has them, so nixos-anywhere still succeeds).
+  imports = [ (modulesPath + "/profiles/qemu-guest.nix") ];
+
   # --- Boot / disk --------------------------------------------------------
   # Filesystems AND the GRUB device come from disko.nix (the EF02 partition sets
   # boot.loader.grub.devices). Hetzner Cloud boots legacy BIOS.
