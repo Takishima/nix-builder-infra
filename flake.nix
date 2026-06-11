@@ -14,6 +14,12 @@
       url = "github:nix-community/disko";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # The Nix fork under test: its packages.default becomes the builders'
+    # nix-daemon (deployed via comin) and the load-test client binary. Pinned by
+    # the lock file — bump deliberately with `nix flake update nix-fork`.
+    # Deliberately no `follows`: the fork builds with its own locked deps so the
+    # runner-built and builder-built derivations are identical.
+    nix-fork.url = "github:Takishima/nix/claude/single-branch-pr-split-xpy8oq";
   };
 
   outputs =
@@ -22,6 +28,7 @@
       nixpkgs,
       comin,
       disko,
+      nix-fork,
       ...
     }:
     let
@@ -39,7 +46,7 @@
         hostname:
         nixpkgs.lib.nixosSystem {
           inherit system;
-          specialArgs = { inherit self; };
+          specialArgs = { inherit self nix-fork; };
           modules = [
             comin.nixosModules.comin
             disko.nixosModules.disko

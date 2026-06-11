@@ -1,0 +1,50 @@
+name: build-fork-nix
+
+# Builds the pinned Nix fork (the flake's nix-fork input) on a GitHub-hosted
+# runner and pushes the closure to Cachix. Run this BEFORE flipping the
+# builders' nix.package to a new pin: comin on the builders then substitutes
+# the prebuilt nix from the cache instead of compiling for an hour on a cx33,
+# and load-test runs fetch the client binary the same way.
+#
+# Triggers: workflow_dispatch for humans, or a push touching
+# build/request.json for Claude Code web sessions (whose scoped token cannot
+# create dispatch events).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["build/request.json"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@c134e4c9e34bac6cab09cf239815f9339aaaf84e # v31.5.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: cachix/cachix-action@0fc020193b5a1fa3ac4575aa3a7d3aa6a35435ad # v16
+        with:
+          name: ${{ vars.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Resolve pinned nix-fork revision
+        id: pin
+        run: |
+          rev=$(jq -r '.nodes."nix-fork".locked.rev' flake.lock)
+          echo "locked nix-fork rev: $rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - name: Build the fork's nix (pushed to Cachix by the action's post-hook)
+        run: |
+          nix build "github:Takishima/nix/${{ steps.pin.outputs.rev }}#default" \
+            --print-build-logs --out-link result
+          ./result/bin/nix --version
