@@ -70,6 +70,12 @@ in
     openssh.authorizedKeys.keyFiles = [ ./keys/ci-builder.pub ];
   };
 
+  # Operations access for the bootstrap/CI key: the bootstrap-builder and
+  # builder-check workflows SSH in as root with this key. Without it the
+  # installed system accepts no logins at all (the installer environment only
+  # had the key injected by Hetzner/nixos-anywhere for the install itself).
+  users.users.root.openssh.authorizedKeys.keyFiles = [ ./keys/ops.pub ];
+
   services.openssh = {
     enable = true;
     settings = {
