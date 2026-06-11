@@ -49,6 +49,11 @@ in
     experimental-features = [
       "nix-command"
       "flakes"
+      # The fork's per-store build coordinator: concurrent BuildDerivation
+      # requests for the same resolved drv coalesce into one build with log
+      # fan-out/replay. The builder-protocol-tests workflow's dedup stage
+      # exercises (and requires) this.
+      "build-coordinator"
     ];
     trusted-users = [
       "root"

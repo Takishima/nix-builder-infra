@@ -37,6 +37,8 @@ web session  --workflow_dispatch--> GH-hosted runner --SSH--> builder   (bootstr
 | `.github/workflows/bootstrap-builder.yml` | One-shot nixos-anywhere install of a fresh server |
 | `.github/workflows/builder-check.yml`     | On-demand SSH health probe, readable from web sessions |
 | `.github/workflows/redeploy-fork.yml`     | Auto-tracks the fork branch: bump pin, prebuild to Cachix, push to main |
+| `.github/workflows/builder-protocol-tests.yml` | Staged end-to-end tests of remote building over ssh-ng (see below) |
+| `tests/remote-build.nix` | Zero-dependency probe derivation the protocol tests build remotely |
 
 ## One-time setup
 
@@ -99,6 +101,32 @@ jobs:
 
 Note: GitHub disables `schedule` triggers on repos with no activity for 60
 days; the notifier (or a manual dispatch) is immune to that.
+
+## Builder protocol tests
+
+The `builder-protocol-tests` workflow validates that a deployed builder works
+as an ssh-ng:// remote builder, in stages (each stage gates the next):
+
+1. **preflight** — SSH sanity probe; hard-fails if the daemon lacks the
+   `build-coordinator` experimental feature (enabled by `builder.nix`).
+2. **single-build** — one fresh derivation (`builtins.currentTime` tag, so it
+   can never be a cache hit) builds remotely. Runs twice: with a **stock**
+   upstream Nix client (old wire protocol) and with the **fork** client
+   (new protocol features negotiated in the handshake).
+3. **concurrent-builds** — two *different* fresh derivations submitted at
+   once; builder-side start clocks in the logs prove the executions
+   overlapped. Again for both client flavours.
+4. **dedup** — the new coordinator feature: a single `.drv` is evaluated up
+   front, then two clients (separate local stores) build it concurrently while
+   it holds itself in-flight ~30s. Passing means the builder ran ONE build:
+   the late joiner received the replayed pre-attach log marker and both
+   clients saw the same build token.
+
+Trigger via `workflow_dispatch` (inputs: `target_ip`, `hold_seconds`) or, from
+a web session, by bumping the nonce in `tests/request.json` and pushing to
+`main`. The test derivation (`tests/remote-build.nix`) has no inputs at all —
+its builder is the sandbox's `/bin/sh` — so only the `.drv` itself crosses the
+wire, which is exactly the protocol path under test.
 
 ## Everyday config deploys
 
