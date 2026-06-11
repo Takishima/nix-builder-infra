@@ -1,0 +1,64 @@
+name: seed-builder
+
+# Pushes a prebuilt closure from Cachix into a builder's local nix store, as
+# root over SSH. Exists for the one-time chicken-and-egg during substituter
+# rollout: a config that ADDS a substituter cannot itself be fetched through
+# that substituter, so without seeding the builder compiles the closure from
+# source. Also handy to pre-warm builders before load tests.
+#
+# Trigger by pushing checks-style request file seed/request.json:
+#   {"target_ip": "...", "store_path": "/nix/store/...", "nonce": 123}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ip:
+        description: "Public IPv4 of the builder"
+        required: true
+      store_path:
+        description: "Store path whose closure to fetch from Cachix on the builder"
+        required: true
+  push:
+    branches: [main]
+    paths: ["seed/request.json"]
+
+permissions:
+  contents: read
+
+jobs:
+  seed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "target_ip=${{ inputs.target_ip }}" >> "$GITHUB_OUTPUT"
+            echo "store_path=${{ inputs.store_path }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "target_ip=$(jq -r .target_ip seed/request.json)" >> "$GITHUB_OUTPUT"
+            echo "store_path=$(jq -r .store_path seed/request.json)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.BUILDER_SSH_PRIVATE_KEY }}" > ~/.ssh/builder
+          chmod 600 ~/.ssh/builder
+
+      - name: Seed closure from Cachix on the builder
+        run: |
+          ssh -i ~/.ssh/builder \
+              -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=15 \
+              "root@${{ steps.params.outputs.target_ip }}" \
+              "set -x
+               systemctl stop comin
+               nix copy --from https://damien.cachix.org '${{ steps.params.outputs.store_path }}' \
+                 --option extra-trusted-public-keys 'damien.cachix.org-1:5ddkbRsrODT9rsBQ43qNLvlxpEEiye1aHsIxxu+SPxw='
+               nix path-info '${{ steps.params.outputs.store_path }}'
+               systemctl start comin
+               systemctl is-active comin"
