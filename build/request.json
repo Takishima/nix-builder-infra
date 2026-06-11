@@ -1,4 +1,4 @@
 {
-  "reason": "rebuild after unity-build fix ef2d2474",
-  "nonce": 1781199016
+  "reason": "build nix-cli (skip functional tests)",
+  "nonce": 1781199781
 }

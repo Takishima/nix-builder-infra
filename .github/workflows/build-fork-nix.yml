@@ -43,8 +43,13 @@ jobs:
           echo "locked nix-fork rev: $rev"
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
 
-      - name: Build the fork's nix (pushed to Cachix by the action's post-hook)
+      # nix-cli rather than #default (nix-everything): the aggregate package
+      # also builds the functional-test suite, which is not needed to deploy
+      # the daemon and currently fails on this branch's new remote-build tests
+      # under the runner's nix sandbox. nix-cli is the same package the
+      # upstream NixOS VM tests use for nix.package.
+      - name: Build the fork's nix-cli (pushed to Cachix by the action's post-hook)
         run: |
-          nix build "github:Takishima/nix/${{ steps.pin.outputs.rev }}#default" \
+          nix build "github:Takishima/nix/${{ steps.pin.outputs.rev }}#nix-cli" \
             --print-build-logs --out-link result
           ./result/bin/nix --version

@@ -3,6 +3,7 @@
   pkgs,
   lib,
   self,
+  nix-fork,
   modulesPath,
   ...
 }:
@@ -35,6 +36,12 @@ in
   networking.firewall.allowedTCPPorts = [ 22 ];
 
   # --- Remote-builder role ------------------------------------------------
+  # The daemon under test: the pinned Nix fork. ssh-ng:// clients that connect
+  # as nixremote run `nix-daemon --stdio` from this package, so this is the
+  # remote endpoint of the builder protocol. Bump via `nix flake update
+  # nix-fork` + the build-fork-nix workflow (populates Cachix) + push.
+  nix.package = nix-fork.packages.${pkgs.system}.nix-cli;
+
   # Mirrors the proven topology in tests/nixos/remote-builds-ssh-ng.nix: a
   # trusted SSH build user, sandboxed builds, and the system-features the Nix
   # scheduler matches against requiredSystemFeatures.
@@ -59,6 +66,10 @@ in
     # Let builders fetch their own substitutes instead of receiving every input
     # over the protocol from the client.
     builders-use-substitutes = true;
+    # The fork's prebuilt closures land here via the build-fork-nix workflow;
+    # comin substitutes them instead of compiling nix on the builder.
+    extra-substituters = [ "https://damien.cachix.org" ];
+    extra-trusted-public-keys = [ "damien.cachix.org-1:5ddkbRsrODT9rsBQ43qNLvlxpEEiye1aHsIxxu+SPxw=" ];
   };
 
   users.groups.nixremote = { };
