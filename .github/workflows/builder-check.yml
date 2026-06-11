@@ -55,3 +55,11 @@ jobs:
           nix --version
           df -h / /nix 2>/dev/null || df -h /
           EOF
+
+      - name: Probe nixremote build user (the ssh-ng:// path used by load tests)
+        run: |
+          ssh -i ~/.ssh/builder \
+              -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=15 \
+              "nixremote@${{ steps.params.outputs.target_ip }}" \
+              'whoami && nix --version && nix store info --store daemon'
