@@ -36,6 +36,7 @@ web session  --workflow_dispatch--> GH-hosted runner --SSH--> builder   (bootstr
 | `provision.sh`  | Sandbox-runnable server creation via the Hetzner HTTPS API (no SSH)  |
 | `.github/workflows/bootstrap-builder.yml` | One-shot nixos-anywhere install of a fresh server |
 | `.github/workflows/builder-check.yml`     | On-demand SSH health probe, readable from web sessions |
+| `.github/workflows/redeploy-fork.yml`     | Auto-tracks the fork branch: bump pin, prebuild to Cachix, push to main |
 
 ## One-time setup
 
@@ -62,6 +63,42 @@ HETZNER_SSH_KEY=hetzner-bootstrap COUNT=1 SERVER_TYPE=cx33 NO_INFECT=1 ./provisi
 
 Do **not** switch a `nixos-infect`ed machine onto this flake: the disko layout
 here describes what nixos-anywhere creates, not an infected image's partitions.
+
+## Automatic redeploys on fork pushes
+
+The `redeploy-fork` workflow keeps the fleet tracking
+`Takishima/nix@claude/single-branch-pr-split-xpy8oq` automatically: it bumps
+the `nix-fork` pin in `flake.lock`, builds the fork's `nix-cli` and pushes its
+closure to Cachix, then commits the lock bump to `main` — at which point comin
+redeploys every builder within ~60s. A failed build never reaches `main`, so
+the fleet keeps the last working pin.
+
+Out of the box it polls the fork branch every 10 minutes (and can be kicked
+manually via `workflow_dispatch`, or from a web session by bumping the nonce in
+`redeploy/request.json`). For true per-commit redeploys, add this notifier to
+**Takishima/nix** with a `BUILDER_INFRA_DISPATCH_TOKEN` secret (fine-grained
+PAT, `contents: read & write` on this repo):
+
+```yaml
+# Takishima/nix: .github/workflows/notify-builder-infra.yml
+name: notify-builder-infra
+on:
+  push:
+    branches: [claude/single-branch-pr-split-xpy8oq]
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl --fail -X POST \
+            -H "Authorization: Bearer ${{ secrets.BUILDER_INFRA_DISPATCH_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Takishima/nix-builder-infra/dispatches \
+            -d '{"event_type":"nix-fork-push"}'
+```
+
+Note: GitHub disables `schedule` triggers on repos with no activity for 60
+days; the notifier (or a manual dispatch) is immune to that.
 
 ## Everyday config deploys
 
