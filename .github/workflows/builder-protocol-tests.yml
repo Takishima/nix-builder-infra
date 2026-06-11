@@ -1,0 +1,309 @@
+name: builder-protocol-tests
+
+# Staged validation that a deployed Hetzner builder actually works as an
+# ssh-ng:// remote builder running the patched Nix fork. A GH-hosted runner
+# plays the client (the web sandbox has no outbound SSH) and offloads real
+# builds via the build hook (--max-jobs 0 --builders "ssh-ng://nixremote@..."),
+# exactly like the fork's own functional tests.
+#
+# Pipeline (each stage gates the next):
+#   preflight          sanity-probe the builder daemon over SSH; hard-fails if
+#                      the build-coordinator experimental feature is missing
+#                      (the dedup stage cannot pass without it).
+#   single-build       one fresh derivation (builtins.currentTime tag) builds
+#                      remotely — once with a stock upstream client (old wire
+#                      protocol) and once with the fork client (new protocol
+#                      features negotiated in the handshake).
+#   concurrent-builds  two *different* fresh derivations submitted at once over
+#                      two ssh-ng sessions; asserts their executions overlapped
+#                      on the builder, for both client flavours.
+#   dedup              the new coordinator feature: one derivation is
+#                      instantiated to a .drv first, then two clients (separate
+#                      local stores, so client-side path locks cannot
+#                      pre-coalesce them) build that same drv concurrently
+#                      while it holds itself in-flight for ~30s. Asserts the
+#                      builder ran ONE build: the late joiner sees the replayed
+#                      MARKER log line, and both clients observe the same
+#                      BUILDTOKEN.
+#
+# Triggers: workflow_dispatch for humans; a push touching tests/request.json
+# for web sessions (whose scoped token cannot create dispatch events).
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ip:
+        description: "Public IPv4 of the builder under test"
+        required: true
+      hold_seconds:
+        description: "How long the dedup-stage build stays in-flight"
+        required: false
+        default: "30"
+  push:
+    branches: [main]
+    paths: ["tests/request.json"]
+
+permissions:
+  contents: read
+
+# Two pipeline runs against the fleet at once would only muddy the timing
+# assertions; serialize them.
+concurrency:
+  group: builder-protocol-tests
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      target_ip: ${{ steps.params.outputs.target_ip }}
+      hold_seconds: ${{ steps.params.outputs.hold_seconds }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "target_ip=${{ inputs.target_ip }}" >> "$GITHUB_OUTPUT"
+            echo "hold_seconds=${{ inputs.hold_seconds }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "target_ip=$(jq -r .target_ip tests/request.json)" >> "$GITHUB_OUTPUT"
+            echo "hold_seconds=$(jq -r '.hold_seconds // 30' tests/request.json)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.BUILDER_SSH_PRIVATE_KEY }}" > ~/.ssh/builder
+          chmod 600 ~/.ssh/builder
+
+      - name: Probe the builder daemon
+        run: |
+          ip="${{ steps.params.outputs.target_ip }}"
+          sshb() {
+            ssh -i ~/.ssh/builder \
+                -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=15 "$@"
+          }
+          sshb "root@$ip" 'hostname && nixos-version && nix --version && systemctl is-active nix-daemon.socket'
+          sshb "nixremote@$ip" 'whoami && nix store info --store daemon'
+
+          # The fleet should be running the locked fork pin; a mismatch usually
+          # just means comin has not converged yet, so warn rather than fail —
+          # the stages below test whatever daemon is actually deployed.
+          locked=$(jq -r '.nodes."nix-fork".locked.rev' flake.lock | cut -c1-7)
+          ver=$(sshb "root@$ip" 'nix --version')
+          if ! echo "$ver" | grep -q "$locked"; then
+            echo "::warning::builder runs '$ver' but flake.lock pins ${locked}; comin may still be converging"
+          fi
+
+      - name: Require the build-coordinator feature on the builder
+        run: |
+          ip="${{ steps.params.outputs.target_ip }}"
+          feats=$(ssh -i ~/.ssh/builder \
+                      -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+                      -o ConnectTimeout=15 \
+                      "root@$ip" 'nix config show experimental-features')
+          echo "builder experimental-features: $feats"
+          case " $feats " in
+            *" build-coordinator "*) echo "coordinator enabled" ;;
+            *)
+              echo "::error::the builder daemon does not have the build-coordinator experimental feature; the dedup stage cannot pass. Deploy the builder.nix that enables it (push to main, wait ~1 min for comin) and re-run."
+              exit 1
+              ;;
+          esac
+
+  # Stage 1: one fresh derivation, built remotely. The currentTime tag makes
+  # the drv new on every run, so success proves the full protocol round-trip
+  # (drv upload, scheduling, sandboxed build, log fan-in, output copy-back)
+  # rather than a cache hit.
+  single-build:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [stock, fork]
+    env:
+      TARGET_IP: ${{ needs.preflight.outputs.target_ip }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protocol-client
+        with:
+          client: ${{ matrix.client }}
+          target-ip: ${{ env.TARGET_IP }}
+          ssh-private-key: ${{ secrets.BUILDER_SSH_PRIVATE_KEY }}
+
+      - name: Build one fresh derivation on the remote builder
+        run: |
+          store="$RUNNER_TEMP/client-store"
+          log="$RUNNER_TEMP/single.log"
+          rc=0
+          out=$(nix build -L --no-link --print-out-paths \
+            --store "$store" --max-jobs 0 \
+            --builders "ssh-ng://nixremote@$TARGET_IP x86_64-linux - 2 1" \
+            -f tests/remote-build.nix \
+            --argstr prefix "single-${{ matrix.client }}-${{ github.run_id }}" \
+            2> "$log") || rc=$?
+          sed 's/^/[build] /' "$log"
+          [ "$rc" -eq 0 ] || { echo "::error::remote build failed"; exit "$rc"; }
+          echo "built remotely: $out"
+          # The output must have been copied back into the client store, and
+          # the build log must have streamed over from the builder.
+          nix path-info --store "$store" "$out"
+          grep -q "MARKER:single-${{ matrix.client }}-" "$log" \
+            || { echo "::error::build log never streamed back from the builder"; exit 1; }
+
+  # Stage 2: two *different* fresh derivations submitted at the same time, each
+  # holding itself in-flight, over two independent ssh-ng sessions. The
+  # BUILDTOKEN lines carry the builder-side start clock, so the gap between
+  # them proves the executions overlapped (a gap >= the hold time would mean
+  # the builder serialized them).
+  concurrent-builds:
+    needs: [preflight, single-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [stock, fork]
+    env:
+      TARGET_IP: ${{ needs.preflight.outputs.target_ip }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protocol-client
+        with:
+          client: ${{ matrix.client }}
+          target-ip: ${{ env.TARGET_IP }}
+          ssh-private-key: ${{ secrets.BUILDER_SSH_PRIVATE_KEY }}
+
+      - name: Build two different derivations at once
+        run: |
+          hold=20
+          store="$RUNNER_TEMP/client-store"
+          build() { # $1 = index
+            nix build -L --no-link \
+              --store "$store" --max-jobs 0 \
+              --builders "ssh-ng://nixremote@$TARGET_IP x86_64-linux - 2 1" \
+              -f tests/remote-build.nix \
+              --argstr prefix "pair$1-${{ matrix.client }}-${{ github.run_id }}" \
+              --arg holdSeconds "$hold" \
+              > "$RUNNER_TEMP/pair$1.log" 2>&1
+          }
+          build 1 & pid1=$!
+          build 2 & pid2=$!
+          rc1=0; rc2=0
+          wait "$pid1" || rc1=$?
+          wait "$pid2" || rc2=$?
+          sed 's/^/[pair1] /' "$RUNNER_TEMP/pair1.log"
+          sed 's/^/[pair2] /' "$RUNNER_TEMP/pair2.log"
+          [ "$rc1" -eq 0 ] || { echo "::error::concurrent build 1 failed"; exit 1; }
+          [ "$rc2" -eq 0 ] || { echo "::error::concurrent build 2 failed"; exit 1; }
+
+          tok1=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$RUNNER_TEMP/pair1.log" | head -n1)
+          tok2=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$RUNNER_TEMP/pair2.log" | head -n1)
+          echo "builder-side start clocks: pair1=$tok1 pair2=$tok2 (hold=${hold}s)"
+          [ -n "$tok1" ] && [ -n "$tok2" ] \
+            || { echo "::error::missing BUILDTOKEN in a streamed log"; exit 1; }
+          awk -v a="$tok1" -v b="$tok2" -v h="$hold" \
+            'BEGIN { d = a > b ? a - b : b - a; exit !(d < h) }' \
+            || { echo "::error::start times are >= ${hold}s apart: the builder serialized the two builds"; exit 1; }
+          echo "the two builds overlapped on the builder"
+
+  # Stage 3: the new coordinator feature. One derivation is evaluated to a .drv
+  # up front (a shared epoch tag plays the builtins.currentTime role so both
+  # client stores instantiate the byte-identical drv), then two clients build
+  # that same drv concurrently while it holds itself in-flight. Distinct local
+  # stores keep the client-side output path locks from coalescing the requests
+  # before they ever reach the wire. Without the coordinator the second daemon
+  # session would just block on the builder's path lock and return "already
+  # valid" — no log ever reaches client B. With it, B attaches to the running
+  # build: the pre-attach MARKER line is replayed to B, and both clients see
+  # the same BUILDTOKEN, i.e. exactly one build ran.
+  dedup:
+    needs: [preflight, concurrent-builds]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      TARGET_IP: ${{ needs.preflight.outputs.target_ip }}
+      HOLD: ${{ needs.preflight.outputs.hold_seconds }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protocol-client
+        with:
+          client: fork
+          target-ip: ${{ env.TARGET_IP }}
+          ssh-private-key: ${{ secrets.BUILDER_SSH_PRIVATE_KEY }}
+
+      - name: Evaluate the derivation once, then race two clients on it
+        run: |
+          storeA="$RUNNER_TEMP/store-A"
+          storeB="$RUNNER_TEMP/store-B"
+          logA="$RUNNER_TEMP/dedup-A.log"
+          logB="$RUNNER_TEMP/dedup-B.log"
+          builders="ssh-ng://nixremote@$TARGET_IP x86_64-linux - 2 1"
+          tag="dedup-${{ github.run_id }}-$(date +%s)"
+
+          # Evaluate first: both stores must hold the SAME .drv, so the
+          # freshness tag is fixed once here instead of letting each
+          # evaluation read its own builtins.currentTime.
+          drvA=$(NIX_REMOTE="$storeA" nix-instantiate tests/remote-build.nix \
+                   --argstr tag "$tag" --arg holdSeconds "$HOLD")
+          drvB=$(NIX_REMOTE="$storeB" nix-instantiate tests/remote-build.nix \
+                   --argstr tag "$tag" --arg holdSeconds "$HOLD")
+          [ "$drvA" = "$drvB" ] \
+            || { echo "::error::instantiation diverged: $drvA vs $drvB"; exit 1; }
+          echo "derivation under test: $drvA (holds for ${HOLD}s)"
+
+          build() { # $1 = local store, $2 = log file
+            nix build -L --no-link \
+              --store "$1" --max-jobs 0 \
+              --builders "$builders" \
+              "$drvA^*" > "$2" 2>&1
+          }
+
+          # Client A starts the (only) build; wait until its marker has
+          # streamed back, i.e. the build is verifiably in-flight.
+          build "$storeA" "$logA" & pidA=$!
+          for _ in $(seq 1 120); do
+            grep -q "MARKER:$tag" "$logA" && break
+            kill -0 "$pidA" 2>/dev/null || break
+            sleep 1
+          done
+          grep -q "MARKER:$tag" "$logA" \
+            || { echo "::error::build A never streamed its marker"; sed 's/^/[A] /' "$logA"; exit 1; }
+
+          # Client B requests the same drv while A's build is still holding.
+          build "$storeB" "$logB" & pidB=$!
+
+          # Informational: ask the coordinator what it is running right now
+          # (should show our drv with 2 subscribers).
+          sleep 5
+          ssh -i ~/.ssh/builder "root@$TARGET_IP" \
+            'nix --extra-experimental-features "nix-command build-coordinator" store active-builds' \
+            || echo "::warning::active-builds probe failed (informational only)"
+
+          rcA=0; rcB=0
+          wait "$pidA" || rcA=$?
+          wait "$pidB" || rcB=$?
+          sed 's/^/[A] /' "$logA"
+          sed 's/^/[B] /' "$logB"
+          [ "$rcA" -eq 0 ] || { echo "::error::build A failed"; exit 1; }
+          [ "$rcB" -eq 0 ] || { echo "::error::build B failed"; exit 1; }
+
+          # Replay proof: the marker was emitted before B attached, so it can
+          # only appear in B's log via the coordinator's buffered replay.
+          grep -q "MARKER:$tag" "$logB" \
+            || { echo "::error::late joiner never saw the replayed marker — the build was not deduped"; exit 1; }
+
+          # Single-execution proof: same builder-side start clock on both ends.
+          tokA=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$logA" | head -n1)
+          tokB=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$logB" | head -n1)
+          echo "token A=$tokA  token B=$tokB"
+          [ -n "$tokA" ] || { echo "::error::no BUILDTOKEN in A's log"; exit 1; }
+          [ "$tokA" = "$tokB" ] \
+            || { echo "::error::tokens differ — two builds ran, no dedup"; exit 1; }
+          echo "dedup OK: one build (token $tokA), two clients, late joiner got the replay"

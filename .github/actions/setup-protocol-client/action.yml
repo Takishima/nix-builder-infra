@@ -1,0 +1,62 @@
+name: setup-protocol-client
+description: >
+  Prepare a GH-hosted runner as an ssh-ng:// remote-build client. Installs
+  upstream Nix, and for the `fork` flavour fetches the pinned Takishima/nix
+  nix-cli from Cachix (substitute-only — the closure was pushed by the
+  redeploy-fork workflow) and puts it first in PATH. Also writes the SSH
+  identity/config the build hook uses to reach nixremote@<builder>.
+
+inputs:
+  client:
+    description: "Client flavour: `stock` (upstream Nix, old protocol) or `fork` (the pinned fork nix-cli, new protocol features)"
+    required: true
+  target-ip:
+    description: "Public IPv4 of the builder; an SSH config entry is written for it"
+    required: true
+  ssh-private-key:
+    description: "Private key authorized for nixremote@ (and root@) on the builder"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: cachix/install-nix-action@c134e4c9e34bac6cab09cf239815f9339aaaf84e # v31.5.1
+      with:
+        extra_nix_config: |
+          experimental-features = nix-command flakes
+          extra-substituters = https://damien.cachix.org
+          extra-trusted-public-keys = damien.cachix.org-1:5ddkbRsrODT9rsBQ43qNLvlxpEEiye1aHsIxxu+SPxw=
+
+    # Same pin as the deployed builders (flake.lock), so client and daemon run
+    # the same fork revision. --max-jobs 0 forbids a local fallback build: if
+    # Cachix misses the closure this fails in seconds instead of compiling Nix
+    # for an hour on the runner.
+    - name: Fetch the pinned fork nix-cli from Cachix
+      if: inputs.client == 'fork'
+      shell: bash
+      run: |
+        rev=$(jq -r '.nodes."nix-fork".locked.rev' flake.lock)
+        echo "fork client rev: $rev"
+        nix build "github:Takishima/nix/${rev}#nix-cli" \
+          --max-jobs 0 --out-link "$RUNNER_TEMP/fork-nix"
+        echo "$RUNNER_TEMP/fork-nix/bin" >> "$GITHUB_PATH"
+
+    - name: Set up SSH access to the builder
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        printf '%s\n' "${{ inputs.ssh-private-key }}" > ~/.ssh/builder
+        chmod 600 ~/.ssh/builder
+        cat >> ~/.ssh/config <<EOF
+        Host ${{ inputs.target-ip }}
+          User nixremote
+          IdentityFile ~/.ssh/builder
+          StrictHostKeyChecking accept-new
+        EOF
+        chmod 600 ~/.ssh/config
+
+    - name: Show the active client
+      shell: bash
+      run: |
+        command -v nix
+        nix --version
