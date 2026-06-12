@@ -28,7 +28,9 @@ name: builder-protocol-tests
 #                      bash builder, coreutils on PATH, builder substitutes
 #                      the stdenv-ish closure itself) — the shape of every
 #                      real-world build, run for both client flavours.
-#                      Parallel to single-build; gates nothing.
+#                      Parallel to single-build; its verdict gates nothing,
+#                      but the timing-sensitive stages wait for it to finish
+#                      so its load cannot skew their assertions.
 #   dedup              the new coordinator feature: one derivation is
 #                      instantiated to a .drv first, then two clients (separate
 #                      local stores, so client-side path locks cannot
@@ -274,11 +276,18 @@ jobs:
   # them proves the executions overlapped (a gap >= the hold time would mean
   # the builder serialized them).
   concurrent-builds:
-    needs: [preflight, single-build]
+    # Ordered after real-build (whose closure downloads and builds occupy the
+    # 2-core builder's job slots and skew the timing assertion below) but not
+    # gated on its verdict — hence the always() + explicit result checks.
+    # max-parallel: 1 for the same reason: each matrix leg submits two builds
+    # that must overlap, which needs both builder slots free.
+    needs: [preflight, single-build, real-build]
+    if: always() && needs.preflight.result == 'success' && needs.single-build.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         client: [stock, fork]
     env:
