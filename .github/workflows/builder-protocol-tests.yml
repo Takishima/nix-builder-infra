@@ -24,6 +24,11 @@ name: builder-protocol-tests
 #   concurrent-builds  two *different* fresh derivations submitted at once over
 #                      two ssh-ng sessions; asserts their executions overlapped
 #                      on the builder, for both client flavours.
+#   real-build         a genuine nixpkgs runCommand derivation (store-path
+#                      bash builder, coreutils on PATH, builder substitutes
+#                      the stdenv-ish closure itself) — the shape of every
+#                      real-world build, run for both client flavours.
+#                      Parallel to single-build; gates nothing.
 #   dedup              the new coordinator feature: one derivation is
 #                      instantiated to a .drv first, then two clients (separate
 #                      local stores, so client-side path locks cannot
@@ -31,7 +36,18 @@ name: builder-protocol-tests
 #                      while it holds itself in-flight for ~30s. Asserts the
 #                      builder ran ONE build: the late joiner sees the replayed
 #                      MARKER log line, and both clients observe the same
-#                      BUILDTOKEN.
+#                      BUILDTOKEN. A third client arriving after completion
+#                      must get a cheap cache hit, not a new execution.
+#   failure-semantics  a deliberately failing build: the error and its log
+#                      must propagate to the client; two clients racing the
+#                      SAME failing drv must both receive the one failure
+#                      (deduped failure); and a fresh build right after must
+#                      succeed (failures must not poison the daemon).
+#   client-abort       a client is SIGKILLed mid-build; a second client then
+#                      builds the same drv and must succeed promptly, and the
+#                      daemon must stay healthy for an unrelated build. Runs
+#                      last: it is the stage most likely to wedge a buggy
+#                      coordinator, and must not mask the other verdicts.
 #
 # Triggers: workflow_dispatch for humans; a push touching tests/request.json
 # for web sessions (whose scoped token cannot create dispatch events).
@@ -208,6 +224,50 @@ jobs:
           grep -q "INPUT:inputs-${{ matrix.client }}-" "$log" \
             || { echo "::error::the toFile input's content never appeared in the build log"; exit 1; }
 
+  # Stage 1c: a real nixpkgs derivation. runCommand means a store-path bash
+  # as the builder and coreutils on PATH — the closure every real-world build
+  # drags in, with builders-use-substitutes letting the builder fetch it from
+  # cache.nixos.org instead of over the wire. First run on a fresh builder
+  # downloads the closure (minutes); later runs are seconds.
+  real-build:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [stock, fork]
+    env:
+      TARGET_IP: ${{ needs.preflight.outputs.target_ip }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protocol-client
+        with:
+          client: ${{ matrix.client }}
+          target-ip: ${{ env.TARGET_IP }}
+          ssh-private-key: ${{ secrets.BUILDER_SSH_PRIVATE_KEY }}
+
+      - name: Build a real runCommand derivation on the remote builder
+        run: |
+          rev=$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock)
+          tag="${{ matrix.client }}-${{ github.run_id }}-$(date +%s)"
+          expr="import ./tests/real-build.nix { pkgs = import (builtins.fetchTarball \"https://github.com/NixOS/nixpkgs/archive/$rev.tar.gz\") {}; tag = \"$tag\"; }"
+          store="$RUNNER_TEMP/client-store"
+          log="$RUNNER_TEMP/real.log"
+          rc=0
+          out=$(nix build -L --no-link --print-out-paths --impure \
+            --store "$store" --max-jobs 0 \
+            --builders "ssh-ng://nixremote@$TARGET_IP x86_64-linux - 2 1" \
+            --expr "$expr" \
+            2> "$log") || rc=$?
+          sed 's/^/[real] /' "$log"
+          [ "$rc" -eq 0 ] || { echo "::error::real-world-shaped remote build failed"; exit "$rc"; }
+          nix path-info --store "$store" "$out"
+          grep -q "MARKER:real-$tag" "$log" \
+            || { echo "::error::build log never streamed back"; exit 1; }
+          grep -q "DONE:real-$tag" "$log" \
+            || { echo "::error::build never ran to completion"; exit 1; }
+
   # Stage 2: two *different* fresh derivations submitted at the same time, each
   # holding itself in-flight, over two independent ssh-ng sessions. The
   # BUILDTOKEN lines carry the builder-side start clock, so the gap between
@@ -361,3 +421,191 @@ jobs:
           [ "$tokA" = "$tokB" ] \
             || { echo "::error::tokens differ — two builds ran, no dedup"; exit 1; }
           echo "dedup OK: one build (token $tokA), two clients, late joiner got the replay"
+
+          # A third client arriving AFTER completion must get the result
+          # without a new execution: either silently (outputs substituted
+          # from the builder) or via a replay of the one finished build —
+          # never a fresh BUILDTOKEN.
+          storeC="$RUNNER_TEMP/store-C"
+          logC="$RUNNER_TEMP/dedup-C.log"
+          drvC=$(NIX_REMOTE="$storeC" nix-instantiate tests/remote-build.nix \
+                   --argstr tag "$tag" --arg holdSeconds "$HOLD")
+          [ "$drvC" = "$drvA" ] || { echo "::error::client C instantiated a different drv"; exit 1; }
+          start_c=$(date +%s)
+          build "$storeC" "$logC" || { sed 's/^/[C] /' "$logC"; echo "::error::post-completion client failed"; exit 1; }
+          took=$(( $(date +%s) - start_c ))
+          sed 's/^/[C] /' "$logC"
+          tokC=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$logC" | head -n1)
+          if [ -n "$tokC" ] && [ "$tokC" != "$tokA" ]; then
+            echo "::error::post-completion client triggered a NEW build (token $tokC != $tokA)"
+            exit 1
+          fi
+          [ "$took" -lt $(( HOLD / 2 + 10 )) ] \
+            || { echo "::error::post-completion client took ${took}s — looks like it rebuilt"; exit 1; }
+          echo "post-completion client OK: cache hit in ${took}s (token: \"$tokC\")"
+
+  # Stage 4: failure semantics. Real-world builds fail all the time; the
+  # protocol must propagate the failure (exit status + streamed log), a
+  # failing drv raced by two clients must produce ONE failed execution that
+  # both observe, and the daemon must stay fully usable afterwards (failed
+  # coordinator builds have wedged this fleet before).
+  failure-semantics:
+    needs: [preflight, dedup]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TARGET_IP: ${{ needs.preflight.outputs.target_ip }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protocol-client
+        with:
+          client: fork
+          target-ip: ${{ env.TARGET_IP }}
+          ssh-private-key: ${{ secrets.BUILDER_SSH_PRIVATE_KEY }}
+
+      - name: A failing build must fail loudly, once, and leave the daemon healthy
+        run: |
+          builders="ssh-ng://nixremote@$TARGET_IP x86_64-linux - 2 1"
+
+          # 1. Plain failure propagation.
+          log="$RUNNER_TEMP/fail.log"
+          rc=0
+          nix build -L --no-link \
+            --store "$RUNNER_TEMP/store-fail" --max-jobs 0 \
+            --builders "$builders" \
+            -f tests/remote-build.nix \
+            --argstr prefix "fail-${{ github.run_id }}" --arg fail true \
+            > "$log" 2>&1 || rc=$?
+          sed 's/^/[fail] /' "$log"
+          [ "$rc" -ne 0 ] || { echo "::error::a failing build reported success"; exit 1; }
+          grep -q "MARKER:fail-" "$log" \
+            || { echo "::error::failing build's log never streamed"; exit 1; }
+          grep -q "FAILING:fail-" "$log" \
+            || { echo "::error::the failure-side log line is missing"; exit 1; }
+
+          # 2. Deduped failure: two clients race ONE failing drv (shared tag,
+          # held in-flight). Both must fail, and the BUILDTOKENs they saw
+          # must match: one execution, both subscribers told.
+          tag="faildedup-${{ github.run_id }}-$(date +%s)"
+          for c in A B; do
+            NIX_REMOTE="$RUNNER_TEMP/fstore-$c" nix-instantiate tests/remote-build.nix \
+              --argstr tag "$tag" --arg holdSeconds 15 --arg fail true > "$RUNNER_TEMP/fdrv-$c"
+          done
+          cmp -s "$RUNNER_TEMP/fdrv-A" "$RUNNER_TEMP/fdrv-B" \
+            || { echo "::error::instantiation diverged"; exit 1; }
+          drv=$(cat "$RUNNER_TEMP/fdrv-A")
+          fbuild() { # $1 = store, $2 = log
+            nix build -L --no-link \
+              --store "$1" --max-jobs 0 --builders "$builders" \
+              "$drv^*" > "$2" 2>&1
+          }
+          rcA=0; rcB=0
+          fbuild "$RUNNER_TEMP/fstore-A" "$RUNNER_TEMP/flog-A" & pidA=$!
+          for _ in $(seq 1 60); do
+            grep -q "MARKER:$tag" "$RUNNER_TEMP/flog-A" && break
+            kill -0 "$pidA" 2>/dev/null || break
+            sleep 1
+          done
+          fbuild "$RUNNER_TEMP/fstore-B" "$RUNNER_TEMP/flog-B" & pidB=$!
+          wait "$pidA" || rcA=$?
+          wait "$pidB" || rcB=$?
+          sed 's/^/[A] /' "$RUNNER_TEMP/flog-A"
+          sed 's/^/[B] /' "$RUNNER_TEMP/flog-B"
+          [ "$rcA" -ne 0 ] || { echo "::error::racing client A saw success on a failing drv"; exit 1; }
+          [ "$rcB" -ne 0 ] || { echo "::error::racing client B saw success on a failing drv"; exit 1; }
+          tokA=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$RUNNER_TEMP/flog-A" | head -n1)
+          tokB=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$RUNNER_TEMP/flog-B" | head -n1)
+          echo "failure tokens: A=$tokA B=$tokB"
+          [ -n "$tokA" ] || { echo "::error::no token in A's failure log"; exit 1; }
+          [ "$tokA" = "$tokB" ] \
+            || { echo "::error::two executions of one failing drv (tokens differ) — failure was not deduped"; exit 1; }
+
+          # 3. The daemon must be healthy immediately after.
+          log="$RUNNER_TEMP/after.log"
+          timeout 120 nix build -L --no-link \
+            --store "$RUNNER_TEMP/store-after" --max-jobs 0 \
+            --builders "$builders" \
+            -f tests/remote-build.nix \
+            --argstr prefix "afterfail-${{ github.run_id }}" \
+            > "$log" 2>&1 \
+            || { sed 's/^/[after] /' "$log"; echo "::error::daemon unhealthy after failed builds"; exit 1; }
+          grep -q "DONE:afterfail-" "$log" \
+            || { echo "::error::post-failure build did not stream its completion"; exit 1; }
+          echo "failure semantics OK: propagated, deduped, daemon healthy"
+
+  # Stage 5: client-abort resilience. Real clients get Ctrl-C'd, lose their
+  # network, or are OOM-killed mid-build. Killing the owning client must not
+  # strand the build or the coordinator: a second client building the same
+  # drv must succeed promptly, and an unrelated build right after must too.
+  # Deliberately the LAST stage — if a buggy coordinator wedges here, every
+  # other verdict is already recorded.
+  client-abort:
+    needs: [preflight, failure-semantics]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TARGET_IP: ${{ needs.preflight.outputs.target_ip }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protocol-client
+        with:
+          client: fork
+          target-ip: ${{ env.TARGET_IP }}
+          ssh-private-key: ${{ secrets.BUILDER_SSH_PRIVATE_KEY }}
+
+      - name: Kill a client mid-build; the drv and the daemon must survive
+        run: |
+          builders="ssh-ng://nixremote@$TARGET_IP x86_64-linux - 2 1"
+          tag="abort-${{ github.run_id }}-$(date +%s)"
+          for c in A B; do
+            NIX_REMOTE="$RUNNER_TEMP/astore-$c" nix-instantiate tests/remote-build.nix \
+              --argstr tag "$tag" --arg holdSeconds 40 > "$RUNNER_TEMP/adrv-$c"
+          done
+          drv=$(cat "$RUNNER_TEMP/adrv-A")
+          [ "$drv" = "$(cat "$RUNNER_TEMP/adrv-B")" ] \
+            || { echo "::error::instantiation diverged"; exit 1; }
+
+          # Client A starts the build and is SIGKILLed once the build is
+          # verifiably in flight on the builder.
+          logA="$RUNNER_TEMP/abort-A.log"
+          nix build -L --no-link \
+            --store "$RUNNER_TEMP/astore-A" --max-jobs 0 --builders "$builders" \
+            "$drv^*" > "$logA" 2>&1 & pidA=$!
+          for _ in $(seq 1 60); do
+            grep -q "MARKER:$tag" "$logA" && break
+            kill -0 "$pidA" 2>/dev/null || break
+            sleep 1
+          done
+          grep -q "MARKER:$tag" "$logA" \
+            || { sed 's/^/[A] /' "$logA"; echo "::error::build A never got in flight"; exit 1; }
+          tokA=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$logA" | head -n1)
+          kill -9 "$pidA" 2>/dev/null || true
+          wait "$pidA" 2>/dev/null || true
+          echo "client A killed mid-build (token was $tokA)"
+          sleep 3
+
+          # Client B claims the same drv. Whether the coordinator adopted the
+          # orphaned build (same token) or restarted it (new token) is
+          # informational; B succeeding promptly is the requirement.
+          logB="$RUNNER_TEMP/abort-B.log"
+          timeout 180 nix build -L --no-link \
+            --store "$RUNNER_TEMP/astore-B" --max-jobs 0 --builders "$builders" \
+            "$drv^*" > "$logB" 2>&1 \
+            || { sed 's/^/[B] /' "$logB"; echo "::error::second client could not finish the abandoned drv"; exit 1; }
+          sed 's/^/[B] /' "$logB"
+          tokB=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$logB" | head -n1)
+          if [ -n "$tokB" ] && [ "$tokB" = "$tokA" ]; then
+            echo "coordinator adopted the orphaned build (token $tokA)"
+          else
+            echo "::notice::build restarted after client death (A=$tokA B=$tokB) — acceptable, but adoption would be better"
+          fi
+
+          # Unrelated build right after: the daemon must not be wedged.
+          log="$RUNNER_TEMP/afterabort.log"
+          timeout 120 nix build -L --no-link \
+            --store "$RUNNER_TEMP/astore-C" --max-jobs 0 --builders "$builders" \
+            -f tests/remote-build.nix \
+            --argstr prefix "afterabort-${{ github.run_id }}" \
+            > "$log" 2>&1 \
+            || { sed 's/^/[after] /' "$log"; echo "::error::daemon unhealthy after client abort"; exit 1; }
+          echo "client-abort OK: drv recovered, daemon healthy"

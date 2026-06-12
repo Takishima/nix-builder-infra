@@ -25,6 +25,9 @@
   prefix ? "remote-test",
   tag ? "${prefix}-${toString builtins.currentTime}",
   holdSeconds ? 0,
+  # When true the build emits its markers and then exits 1 — for testing
+  # failure propagation and deduped-failure semantics over the protocol.
+  fail ? false,
 }:
 derivation {
   name = tag;
@@ -43,8 +46,18 @@ derivation {
         read now _rest < /proc/uptime
         now_s=''${now%.*}
       done
-      echo "DONE:${tag}"
-      echo "$start ${tag}" > "$out"
+      ${
+        if fail then
+          ''
+            echo "FAILING:${tag}"
+            exit 1
+          ''
+        else
+          ''
+            echo "DONE:${tag}"
+            echo "$start ${tag}" > "$out"
+          ''
+      }
     ''
   ];
 }
