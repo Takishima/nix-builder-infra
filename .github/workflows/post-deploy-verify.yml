@@ -69,7 +69,11 @@ jobs:
         run: |
           sha="${{ steps.params.outputs.sha }}"
           ip="${{ steps.params.outputs.ip }}"
-          for i in $(seq 1 40); do
+          # 20 min: config-only commits converge in ~2, but a nix-fork pin
+          # bump makes the builder download the whole new daemon closure
+          # first — 10 min proved too short for that and caused two false
+          # reverts of good bumps.
+          for i in $(seq 1 80); do
             deployed=$(ssh -i ~/.ssh/builder \
                 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
                 -o ConnectTimeout=15 "root@$ip" \
