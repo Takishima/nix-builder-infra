@@ -14,6 +14,13 @@ name: builder-protocol-tests
 #                      remotely — once with a stock upstream client (old wire
 #                      protocol) and once with the fork client (new protocol
 #                      features negotiated in the handshake).
+#   single-build-with-inputs
+#                      same round-trip but the derivation has a real input
+#                      closure (store-path build script + toFile source), so
+#                      it fails if the builder sets up the sandbox without
+#                      the inputs. Runs parallel to single-build and gates
+#                      nothing: a red here must not hide the other stages'
+#                      verdicts.
 #   concurrent-builds  two *different* fresh derivations submitted at once over
 #                      two ssh-ng sessions; asserts their executions overlapped
 #                      on the builder, for both client flavours.
@@ -156,6 +163,50 @@ jobs:
           nix path-info --store "$store" "$out"
           grep -q "MARKER:single-${{ matrix.client }}-" "$log" \
             || { echo "::error::build log never streamed back from the builder"; exit 1; }
+
+  # Stage 1b: the regression probe for builds that arrive with a real input
+  # closure. All the other probes are input-free (their builder is the
+  # sandbox-provided /bin/sh), which is exactly why the pipeline stayed green
+  # while every comin system rebuild on the same machine failed with
+  # "executing '...-bash/bin/bash': No such file or directory" — a sandbox
+  # missing its inputs is invisible to a derivation that has none. This probe
+  # only succeeds if both input paths (the store-path build script and the
+  # toFile source) were uploaded and bind-mounted into the sandbox.
+  single-build-with-inputs:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [stock, fork]
+    env:
+      TARGET_IP: ${{ needs.preflight.outputs.target_ip }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-protocol-client
+        with:
+          client: ${{ matrix.client }}
+          target-ip: ${{ env.TARGET_IP }}
+          ssh-private-key: ${{ secrets.BUILDER_SSH_PRIVATE_KEY }}
+
+      - name: Build a derivation with a real input closure on the remote builder
+        run: |
+          store="$RUNNER_TEMP/client-store"
+          log="$RUNNER_TEMP/with-inputs.log"
+          rc=0
+          out=$(nix build -L --no-link --print-out-paths \
+            --store "$store" --max-jobs 0 \
+            --builders "ssh-ng://nixremote@$TARGET_IP x86_64-linux - 2 1" \
+            -f tests/remote-build-with-inputs.nix \
+            --argstr prefix "inputs-${{ matrix.client }}-${{ github.run_id }}" \
+            2> "$log") || rc=$?
+          sed 's/^/[build] /' "$log"
+          [ "$rc" -eq 0 ] || { echo "::error::remote build with a real input closure failed — sandbox likely missing the drv's inputs"; exit "$rc"; }
+          echo "built remotely: $out"
+          nix path-info --store "$store" "$out"
+          grep -q "INPUT:inputs-${{ matrix.client }}-" "$log" \
+            || { echo "::error::the toFile input's content never appeared in the build log"; exit 1; }
 
   # Stage 2: two *different* fresh derivations submitted at the same time, each
   # holding itself in-flight, over two independent ssh-ng sessions. The
