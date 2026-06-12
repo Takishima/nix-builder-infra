@@ -183,10 +183,13 @@ jobs:
       - name: Build two different derivations at once
         run: |
           hold=20
-          store="$RUNNER_TEMP/client-store"
+          # One local store per client process: two `nix build`s sharing a
+          # store race on its SQLite db ("database is busy") before either
+          # request reaches the builder. The builds must only be concurrent
+          # builder-side, over their two ssh-ng sessions.
           build() { # $1 = index
             nix build -L --no-link \
-              --store "$store" --max-jobs 0 \
+              --store "$RUNNER_TEMP/client-store-$1" --max-jobs 0 \
               --builders "ssh-ng://nixremote@$TARGET_IP x86_64-linux - 2 1" \
               -f tests/remote-build.nix \
               --argstr prefix "pair$1-${{ matrix.client }}-${{ github.run_id }}" \
