@@ -39,8 +39,12 @@ jobs:
 
       - name: Run the pre-switch smoke build with it
         run: |
-          scratch=$(mktemp -d "$RUNNER_TEMP/smoke.XXXXXXXX")
-          ./fork-nix/bin/nix build --no-link \
+          # sudo: the gate runs as root on the builders, and unprivileged
+          # chroot-store local builds cannot write their outputs ("cannot
+          # create $out: Permission denied" for every rev, even known-good
+          # ones), so an unprivileged run here would only test the harness.
+          scratch=$(sudo mktemp -d /root/smoke.XXXXXXXX)
+          sudo ./fork-nix/bin/nix build --no-link \
             --extra-experimental-features 'nix-command' \
             --store "$scratch" \
             --option substituters "" \
@@ -53,8 +57,8 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          scratch=$(mktemp -d "$RUNNER_TEMP/smoke-coord.XXXXXXXX")
-          timeout 300 ./fork-nix/bin/nix build --no-link \
+          scratch=$(sudo mktemp -d /root/smoke-coord.XXXXXXXX)
+          sudo timeout 300 ./fork-nix/bin/nix build --no-link \
             --extra-experimental-features 'nix-command build-coordinator' \
             --store "$scratch" \
             --option substituters "" \
