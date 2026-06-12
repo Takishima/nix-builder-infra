@@ -195,6 +195,37 @@ in
     pathConfig.PathChanged = "/run/current-system";
   };
 
+  # --- Workaround: clear stale coordinator lock after each deploy ---------
+  # Fork bug (see bug-report-coordinator-scratch-store-wedge.md): when the
+  # per-store build coordinator exits it leaves /nix/var/nix/
+  # coordinator.socket.lock behind (root, 0600), and every later
+  # *unprivileged* daemon relay blocks on it indefinitely — each comin deploy
+  # therefore wedges the builder's ssh-ng path. Until the fork cleans up (or
+  # opens up) its lock, remove it after every generation switch, but only
+  # when no live coordinator still holds the flock.
+  systemd.services.coordinator-lock-cleanup = {
+    description = "Remove a stale Nix build-coordinator lock left by the previous deploy";
+    path = [
+      pkgs.util-linux
+      pkgs.coreutils
+    ];
+    serviceConfig.Type = "oneshot";
+    script = ''
+      lock=/nix/var/nix/coordinator.socket.lock
+      [ -e "$lock" ] || exit 0
+      if flock -n "$lock" true 2>/dev/null; then
+        rm -f "$lock" /nix/var/nix/coordinator.socket
+        echo "removed stale coordinator lock"
+      else
+        echo "coordinator lock is held by a live coordinator; leaving it"
+      fi
+    '';
+  };
+  systemd.paths.coordinator-lock-cleanup = {
+    wantedBy = [ "multi-user.target" ];
+    pathConfig.PathChanged = "/run/current-system";
+  };
+
   # --- Misc ---------------------------------------------------------------
   time.timeZone = "UTC";
   environment.systemPackages = [ pkgs.git ];
