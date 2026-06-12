@@ -1,0 +1,87 @@
+name: builder-ops
+
+# Small remote-hands workflow for a builder that has wedged itself — the web
+# sandbox driving this repo has no outbound SSH, so recovery has to go
+# through a GH-hosted runner. Only a fixed set of actions, no free-form
+# commands.
+#
+# Actions:
+#   status      processes, units, coordinator state, recent journal — no
+#               changes.
+#   recover     stop comin (killing its whole cgroup, which is where crashed
+#               deploys leave stale coordinator processes holding the store
+#               lock), clear any stale coordinator socket, restart the nix
+#               daemon. Leaves comin STOPPED: with the fork's local builds
+#               broken, every comin attempt can re-wedge the box. Use
+#               start-comin (or reboot) once a fixed fork pin has landed.
+#   start-comin start the comin service again.
+#   reboot      reboot the machine into its current generation.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ip:
+        description: "Public IPv4 of the builder"
+        required: true
+      action:
+        description: "What to do"
+        required: true
+        type: choice
+        options: [status, recover, start-comin, reboot]
+
+permissions:
+  contents: read
+
+jobs:
+  ops:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.BUILDER_SSH_PRIVATE_KEY }}" > ~/.ssh/builder
+          chmod 600 ~/.ssh/builder
+
+      - name: Run ${{ inputs.action }}
+        run: |
+          sshb() {
+            ssh -i ~/.ssh/builder \
+                -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=15 "root@${{ inputs.target_ip }}" "$@"
+          }
+          case "${{ inputs.action }}" in
+            status)
+              sshb 'set -x
+                    uptime
+                    systemctl status comin nix-daemon.service nix-daemon.socket --no-pager -l || true
+                    ps -eo pid,ppid,etime,cmd | grep -v grep | grep -i nix || true
+                    ls -la /nix/var/nix/ | grep -i coordinator || true
+                    journalctl -u comin --no-pager -n 15 || true'
+              ;;
+            recover)
+              sshb 'set -x
+                    # Killing the comin unit takes its whole cgroup with it —
+                    # including coordinator processes that a crashed deploy
+                    # left holding the big store lock.
+                    systemctl stop comin || true
+                    sleep 2
+                    # Anything still wedged on the store from those builds.
+                    pkill -9 -f "nix-store --serve" || true
+                    rm -f /nix/var/nix/coordinator*.socket 2>/dev/null || true
+                    systemctl restart nix-daemon.socket
+                    systemctl restart nix-daemon.service || true
+                    sleep 2
+                    systemctl is-active nix-daemon.socket
+                    ps -eo pid,ppid,etime,cmd | grep -v grep | grep -i nix || true
+                    echo "recover done; comin left stopped on purpose"'
+              ;;
+            start-comin)
+              sshb 'systemctl start comin && systemctl is-active comin'
+              ;;
+            reboot)
+              # The && true keeps the dropped connection from failing the job.
+              sshb 'systemctl reboot' || true
+              echo "reboot issued"
+              ;;
+          esac
