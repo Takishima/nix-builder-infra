@@ -121,6 +121,35 @@ in
   # --configuration-revision`) can identify the deployed revision.
   system.configurationRevision = rev;
 
+  # --- Pre-switch acceptance check ----------------------------------------
+  # Abort the switch unless the INCOMING system's Nix can actually build a
+  # derivation with a real input closure. This is the regression the fork has
+  # shipped twice (sandbox set up without the drv's inputs: "executing
+  # '...-bash/bin/bash': No such file or directory"), and input-free probes
+  # cannot see it. The build runs in a throwaway store, so it exercises the
+  # chroot sandbox and the per-store build coordinator without touching
+  # /nix/store's coordinator or locks — a failure leaves the running system
+  # untouched and comin simply stays on the current generation.
+  system.preSwitchChecks.fork-daemon-smoke-build = ''
+    incoming="$1"
+    nix="$incoming/sw/bin/nix"
+    if [ ! -x "$nix" ]; then
+      echo "pre-switch smoke: no nix binary at $nix; failing closed" >&2
+      exit 1
+    fi
+    scratch=$(${pkgs.coreutils}/bin/mktemp -d /tmp/pre-switch-smoke.XXXXXXXX)
+    trap '${pkgs.coreutils}/bin/rm -rf "$scratch"' EXIT
+    echo "pre-switch smoke: building an input-bearing derivation with $("$nix" --version)"
+    "$nix" build --no-link \
+      --extra-experimental-features 'nix-command build-coordinator' \
+      --store "$scratch" \
+      --option substituters "" \
+      -f ${./tests/remote-build-with-inputs.nix} \
+      --argstr prefix pre-switch-smoke \
+      || { echo "pre-switch smoke: the incoming Nix cannot build a drv with inputs; refusing to switch" >&2; exit 1; }
+    echo "pre-switch smoke: OK"
+  '';
+
   # --- Observability: report convergence back to GitHub -------------------
   # The web sandbox cannot SSH in to check a deploy, so each builder POSTs a
   # commit status for the deployed SHA. Claude then reads it via the GitHub MCP

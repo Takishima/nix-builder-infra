@@ -32,6 +32,9 @@ on:
 
 permissions:
   contents: write
+  # To dispatch post-deploy-verify for the lock bump (GITHUB_TOKEN pushes
+  # never trigger push workflows on their own).
+  actions: write
 
 # Builds take a while; serialize runs so two bumps never race on main. A run
 # queued behind a finished bump exits early at the changed=false check.
@@ -120,3 +123,19 @@ jobs:
           # over anything that did not itself touch flake.lock.
           git pull --rebase origin main
           git push origin main
+
+      # GITHUB_TOKEN pushes never trigger push workflows, so the post-switch
+      # verification (convergence + smoke build, with auto-revert) has to be
+      # dispatched for the bump commit explicitly.
+      - name: Dispatch post-deploy verification for the bump
+        if: steps.head.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bump=$(git rev-parse HEAD)
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/post-deploy-verify.yml/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"sha\":\"$bump\"}}"

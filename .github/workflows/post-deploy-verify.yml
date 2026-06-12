@@ -1,0 +1,127 @@
+name: post-deploy-verify
+
+# The post-switch half of the acceptance gates (the pre-switch half is
+# system.preSwitchChecks in builder.nix). After a push to main, wait for
+# comin to converge the builder to the pushed revision, then run a real
+# input-bearing remote build over ssh-ng. If the deploy never converges or
+# the smoke build fails, revert the commit on main: comin then rolls the
+# fleet back to the last good revision (its closure is still in the store,
+# so the rollback switch is immediate).
+#
+# Loop safety: the revert is pushed with GITHUB_TOKEN, which never triggers
+# workflows — a failing revert cannot ping-pong. For the same reason the
+# redeploy-fork lock bumps do not trigger this workflow on push; that
+# workflow dispatches us explicitly instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Revision the fleet should converge to (default: branch head)"
+        required: false
+      target_ip:
+        description: "Builder IPv4 (default: tests/request.json)"
+        required: false
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: post-deploy-verify
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve parameters
+        id: params
+        run: |
+          sha="${{ inputs.sha }}"
+          [ -n "$sha" ] || sha="${{ github.sha }}"
+          ip="${{ inputs.target_ip }}"
+          [ -n "$ip" ] || ip=$(jq -r .target_ip tests/request.json)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          echo "verifying deploy of $sha on $ip"
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.BUILDER_SSH_PRIVATE_KEY }}" > ~/.ssh/builder
+          chmod 600 ~/.ssh/builder
+
+      - name: Wait for comin to converge to the pushed revision
+        run: |
+          sha="${{ steps.params.outputs.sha }}"
+          ip="${{ steps.params.outputs.ip }}"
+          for i in $(seq 1 40); do
+            deployed=$(ssh -i ~/.ssh/builder \
+                -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=15 "root@$ip" \
+                'nixos-version --configuration-revision' 2>/dev/null || echo unreachable)
+            echo "poll $i: deployed=$deployed"
+            [ "$deployed" = "$sha" ] && { echo "converged"; exit 0; }
+            sleep 15
+          done
+          echo "::error::builder never converged to $sha (deploy failed, or the pre-switch check refused it)"
+          exit 1
+
+      - uses: cachix/install-nix-action@c134e4c9e34bac6cab09cf239815f9339aaaf84e # v31.5.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Smoke-build a derivation with a real input closure on the builder
+        run: |
+          ip="${{ steps.params.outputs.ip }}"
+          export NIX_SSHOPTS="-i $HOME/.ssh/builder -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
+          log="$RUNNER_TEMP/postdeploy.log"
+          rc=0
+          nix build -L --no-link \
+            --store "$RUNNER_TEMP/client-store" --max-jobs 0 \
+            --builders "ssh-ng://nixremote@$ip x86_64-linux - 2 1" \
+            -f tests/remote-build-with-inputs.nix \
+            --argstr prefix "postdeploy-${{ github.run_id }}" \
+            2> "$log" || rc=$?
+          sed 's/^/[smoke] /' "$log"
+          [ "$rc" -eq 0 ] || { echo "::error::post-deploy smoke build failed"; exit 1; }
+          grep -q "INPUT:postdeploy-" "$log" \
+            || { echo "::error::input content never streamed back"; exit 1; }
+          echo "post-deploy verification passed"
+
+      - name: Revert the commit on failure
+        if: failure()
+        run: |
+          sha="${{ steps.params.outputs.sha }}"
+          ip="${{ steps.params.outputs.ip }}"
+          head=$(git rev-parse origin/main)
+          if [ "$head" != "$sha" ]; then
+            echo "::warning::main has moved past $sha; leaving the revert to the newer run"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git revert --no-edit "$sha" \
+            || { echo "::error::cannot revert $sha automatically (conflict); manual rollback needed"; exit 1; }
+          git push origin main
+          echo "reverted $sha on main; waiting for the fleet to roll back"
+          back=$(git rev-parse HEAD)
+          for i in $(seq 1 20); do
+            deployed=$(ssh -i ~/.ssh/builder \
+                -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=15 "root@$ip" \
+                'nixos-version --configuration-revision' 2>/dev/null || echo unreachable)
+            echo "rollback poll $i: deployed=$deployed (want $back)"
+            [ "$deployed" = "$back" ] && { echo "fleet rolled back"; exit 0; }
+            sleep 15
+          done
+          echo "::warning::rollback commit pushed but convergence not yet observed"
