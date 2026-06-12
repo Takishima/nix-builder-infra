@@ -136,3 +136,25 @@ wire, which is exactly the protocol path under test.
 3. Push to `main`. comin converges each builder within ~60s.
 4. Observe via the `builder-check` workflow, or commit statuses if the status
    token is installed on the builders.
+
+## Recovering a wedged builder
+
+On fork revisions whose local-build path is broken, a failed comin deploy can
+leave coordinator processes behind (inside the comin cgroup) holding the
+exclusive store lock; from then on every daemon build session hangs a few
+minutes and dies with "Nix daemon disconnected unexpectedly". The
+`builder-ops` workflow is the remote-hands fix (`workflow_dispatch`, inputs
+`target_ip` + `action`):
+
+- `status` — units, nix processes, recent comin journal; read-only.
+- `recover` — stop comin (killing the stale cgroup), restore the
+  socket-activated nix daemon. Leaves comin stopped: start it again only once
+  a working fork pin is on `main`, or every deploy attempt can re-wedge the
+  box.
+- `start-comin` — resume GitOps deploys.
+- `reboot` — boot the current generation from scratch.
+
+If the machine is beyond that, reinstall it in place with the
+`bootstrap-builder` workflow (~5 min, wipes the disk; the builders are
+stateless), which builds the system runner-side and so does not depend on the
+on-box daemon at all.
