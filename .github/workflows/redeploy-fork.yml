@@ -2,10 +2,13 @@ name: redeploy-fork
 
 # Keeps the fleet tracking the Nix branch under test, end to end: when
 # Takishima/nix's claude/single-branch-pr-split-xpy8oq branch moves, bump the
-# flake.lock nix-fork pin, prebuild the fork's nix-cli into Cachix, then push
-# the lock bump to main. comin on each builder picks that up within ~60s and
-# redeploys the cluster, substituting the prebuilt nix from the cache instead
-# of compiling for an hour on a cx33.
+# flake.lock nix-fork pin, prebuild the fork's nix-cli AND the full system
+# closure into Cachix, then push the lock bump to main. comin on each builder
+# picks that up within ~60s and redeploys the cluster, substituting everything
+# from the cache instead of compiling on a cx33 — without the system closure,
+# nix-dependent packages (nixos-rebuild-ng and friends) rebuilt on-box and
+# routinely blew post-deploy-verify's 20-minute convergence budget, costing a
+# spurious auto-revert per bump.
 #
 # Triggers:
 #   - repository_dispatch (type nix-fork-push): per-commit, sent by a tiny
@@ -99,6 +102,19 @@ jobs:
           echo "new locked nix-fork rev: $rev"
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
 
+      # Committed BEFORE the system build so the tree is clean and self.rev
+      # matches what comin will evaluate. If main moves during the build the
+      # later rebase rewrites the sha and only the configurationRevision-
+      # dependent drvs (toplevel, nixos-version — seconds of on-box work)
+      # miss the cache; every heavy path still substitutes.
+      - name: Commit the lock bump
+        if: steps.head.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          short=$(echo "${{ steps.pin.outputs.rev }}" | cut -c1-12)
+          git commit -m "Bump nix-fork to ${short} (auto-redeploy)" flake.lock
+
       # nix-cli rather than #default (nix-everything) for the same reasons as
       # build-fork-nix.yml: it skips the functional-test suite and is the
       # package the builders run as nix.package.
@@ -110,15 +126,23 @@ jobs:
           ./result/bin/nix --version
           cachix push "${{ vars.CACHIX_CACHE_NAME }}" "$(readlink -f result)"
 
-      # Only now is the new pin allowed onto the deploy branch. If the build
+      # The system closure contains nix-cli plus everything that depends on
+      # it; with this in the cache a bump deploy converges in a couple of
+      # minutes instead of compiling nix dependents on the builder. One host
+      # suffices: the others differ only in hostname-derived leaves.
+      - name: Build the full system closure and push it to Cachix
+        if: steps.head.outputs.changed == 'true'
+        run: |
+          nix build \
+            ".#nixosConfigurations.nix-builder-01.config.system.build.toplevel" \
+            --print-build-logs --out-link system
+          cachix push "${{ vars.CACHIX_CACHE_NAME }}" "$(readlink -f system)"
+
+      # Only now is the new pin allowed onto the deploy branch. If a build
       # failed above, main keeps the old, working pin.
       - name: Push the lock bump to main (comin deploys it)
         if: steps.head.outputs.changed == 'true'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          short=$(echo "${{ steps.pin.outputs.rev }}" | cut -c1-12)
-          git commit -m "Bump nix-fork to ${short} (auto-redeploy)" flake.lock
           # main may have moved during the build; the lock bump rebases cleanly
           # over anything that did not itself touch flake.lock.
           git pull --rebase origin main
