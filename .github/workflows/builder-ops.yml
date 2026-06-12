@@ -67,7 +67,9 @@ jobs:
                     systemctl stop comin || true
                     sleep 2
                     # Anything still wedged on the store from those builds.
-                    pkill -9 -f "nix-store --serve" || true
+                    # The bracket keeps pkill -f from matching this very
+                    # script inside the SSH session's bash cmdline.
+                    pkill -9 -f "nix-store [-]-serve" || true
                     rm -f /nix/var/nix/coordinator*.socket 2>/dev/null || true
                     systemctl restart nix-daemon.socket
                     systemctl restart nix-daemon.service || true
