@@ -137,7 +137,9 @@ in
       echo "pre-switch smoke: no nix binary at $nix; failing closed" >&2
       exit 1
     fi
-    scratch=$(${pkgs.coreutils}/bin/mktemp -d /tmp/pre-switch-smoke.XXXXXXXX)
+    # Not under /tmp: nix refuses a store rooted in a world-writable
+    # directory ("Path '/tmp' is world-writable or a symlink").
+    scratch=$(${pkgs.coreutils}/bin/mktemp -d /root/pre-switch-smoke.XXXXXXXX)
     trap '${pkgs.coreutils}/bin/rm -rf "$scratch"' EXIT
     echo "pre-switch smoke: building an input-bearing derivation with $("$nix" --version)"
     "$nix" build --no-link \

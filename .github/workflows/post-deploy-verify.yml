@@ -12,6 +12,12 @@ name: post-deploy-verify
 # workflows — a failing revert cannot ping-pong. For the same reason the
 # redeploy-fork lock bumps do not trigger this workflow on push; that
 # workflow dispatches us explicitly instead.
+#
+# Known limitation: GITHUB_TOKEN may not modify .github/workflows/*, so a
+# failing commit that itself touched workflow files cannot be auto-reverted
+# (the push is rejected); the job fails loudly and the rollback is manual.
+# Pre-switch checks still keep such a commit from ever activating on the
+# fleet, so the blast radius is "main is red", not "the builder is broken".
 
 on:
   workflow_dispatch:
