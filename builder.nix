@@ -142,14 +142,11 @@ in
     scratch=$(${pkgs.coreutils}/bin/mktemp -d /root/pre-switch-smoke.XXXXXXXX)
     trap '${pkgs.coreutils}/bin/rm -rf "$scratch"' EXIT
     echo "pre-switch smoke: building an input-bearing derivation with $("$nix" --version)"
-    # Deliberately WITHOUT the build-coordinator feature: a coordinator
-    # spawned for the scratch store outlives the check and poisons later
-    # daemon builds ("Nix daemon disconnected unexpectedly" hangs, observed
-    # on the first deploy of this check). The chroot/input-closure path —
-    # the regression this check exists for — is exercised either way; the
-    # coordinator behaviour is covered remotely by builder-protocol-tests.
+    # With the coordinator enabled this also gates on the incoming Nix's
+    # coordinator lifecycle (a fork rev that strands its socket lock would
+    # be caught here and at the post-deploy smoke).
     "$nix" build --no-link \
-      --extra-experimental-features 'nix-command' \
+      --extra-experimental-features 'nix-command build-coordinator' \
       --store "$scratch" \
       --option substituters "" \
       -f ${./tests/remote-build-with-inputs.nix} \
@@ -191,37 +188,6 @@ in
 
   # Fire the reporter whenever the active system generation changes.
   systemd.paths.report-deploy-status = {
-    wantedBy = [ "multi-user.target" ];
-    pathConfig.PathChanged = "/run/current-system";
-  };
-
-  # --- Workaround: clear stale coordinator lock after each deploy ---------
-  # Fork bug (see bug-report-coordinator-scratch-store-wedge.md): when the
-  # per-store build coordinator exits it leaves /nix/var/nix/
-  # coordinator.socket.lock behind (root, 0600), and every later
-  # *unprivileged* daemon relay blocks on it indefinitely — each comin deploy
-  # therefore wedges the builder's ssh-ng path. Until the fork cleans up (or
-  # opens up) its lock, remove it after every generation switch, but only
-  # when no live coordinator still holds the flock.
-  systemd.services.coordinator-lock-cleanup = {
-    description = "Remove a stale Nix build-coordinator lock left by the previous deploy";
-    path = [
-      pkgs.util-linux
-      pkgs.coreutils
-    ];
-    serviceConfig.Type = "oneshot";
-    script = ''
-      lock=/nix/var/nix/coordinator.socket.lock
-      [ -e "$lock" ] || exit 0
-      if flock -n "$lock" true 2>/dev/null; then
-        rm -f "$lock" /nix/var/nix/coordinator.socket
-        echo "removed stale coordinator lock"
-      else
-        echo "coordinator lock is held by a live coordinator; leaving it"
-      fi
-    '';
-  };
-  systemd.paths.coordinator-lock-cleanup = {
     wantedBy = [ "multi-user.target" ];
     pathConfig.PathChanged = "/run/current-system";
   };
