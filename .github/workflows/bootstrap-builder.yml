@@ -48,6 +48,11 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+            # The system closure includes the pinned Nix fork; substitute it
+            # from the cache build-fork-nix/redeploy-fork populated instead of
+            # compiling it for an hour on the runner.
+            extra-substituters = https://damien.cachix.org
+            extra-trusted-public-keys = damien.cachix.org-1:5ddkbRsrODT9rsBQ43qNLvlxpEEiye1aHsIxxu+SPxw=
 
       - name: Set up SSH key
         run: |
