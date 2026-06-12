@@ -142,8 +142,14 @@ in
     scratch=$(${pkgs.coreutils}/bin/mktemp -d /root/pre-switch-smoke.XXXXXXXX)
     trap '${pkgs.coreutils}/bin/rm -rf "$scratch"' EXIT
     echo "pre-switch smoke: building an input-bearing derivation with $("$nix" --version)"
+    # Deliberately WITHOUT the build-coordinator feature: a coordinator
+    # spawned for the scratch store outlives the check and poisons later
+    # daemon builds ("Nix daemon disconnected unexpectedly" hangs, observed
+    # on the first deploy of this check). The chroot/input-closure path —
+    # the regression this check exists for — is exercised either way; the
+    # coordinator behaviour is covered remotely by builder-protocol-tests.
     "$nix" build --no-link \
-      --extra-experimental-features 'nix-command build-coordinator' \
+      --extra-experimental-features 'nix-command' \
       --store "$scratch" \
       --option substituters "" \
       -f ${./tests/remote-build-with-inputs.nix} \
