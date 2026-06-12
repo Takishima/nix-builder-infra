@@ -1,0 +1,64 @@
+name: fork-smoke
+
+# Diagnostic: run the same smoke build the builders' pre-switch check uses,
+# but on a GH runner against an arbitrary fork revision — without deploying
+# anything. Used to find out WHY a pin bump was refused by the fleet (the
+# builder journal only retains the latest deploy) and to pre-qualify a fork
+# rev before bumping. The closure must already be in Cachix (redeploy-fork
+# pushes it before any bump, so refused bumps always have one).
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork_rev:
+        description: "Takishima/nix revision to smoke-test"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@c134e4c9e34bac6cab09cf239815f9339aaaf84e # v31.5.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-substituters = https://damien.cachix.org
+            extra-trusted-public-keys = damien.cachix.org-1:5ddkbRsrODT9rsBQ43qNLvlxpEEiye1aHsIxxu+SPxw=
+
+      - name: Fetch the fork's nix-cli
+        run: |
+          nix build "github:Takishima/nix/${{ inputs.fork_rev }}#nix-cli" \
+            --print-build-logs --out-link fork-nix
+          ./fork-nix/bin/nix --version
+
+      - name: Run the pre-switch smoke build with it
+        run: |
+          scratch=$(mktemp -d "$RUNNER_TEMP/smoke.XXXXXXXX")
+          ./fork-nix/bin/nix build --no-link \
+            --extra-experimental-features 'nix-command' \
+            --store "$scratch" \
+            --option substituters "" \
+            -f tests/remote-build-with-inputs.nix \
+            --argstr prefix fork-smoke \
+            --print-build-logs
+          echo "smoke OK"
+
+      - name: Same build with the coordinator enabled (informational)
+        if: always()
+        continue-on-error: true
+        run: |
+          scratch=$(mktemp -d "$RUNNER_TEMP/smoke-coord.XXXXXXXX")
+          timeout 300 ./fork-nix/bin/nix build --no-link \
+            --extra-experimental-features 'nix-command build-coordinator' \
+            --store "$scratch" \
+            --option substituters "" \
+            -f tests/remote-build-with-inputs.nix \
+            --argstr prefix fork-smoke-coord \
+            --print-build-logs
+          echo "coordinator smoke OK"
