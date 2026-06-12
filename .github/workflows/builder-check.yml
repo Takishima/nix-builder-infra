@@ -11,6 +11,16 @@ on:
       target_ip:
         description: "Public IPv4 of the builder"
         required: true
+      journal_lines:
+        description: "comin journal lines to tail"
+        required: false
+        default: "30"
+      journal_since:
+        description: "journalctl --since (e.g. '2026-06-12 14:50:00'); overrides the tail"
+        required: false
+      journal_until:
+        description: "journalctl --until, only with journal_since"
+        required: false
   push:
     branches: [main]
     paths: ["checks/request.json"]
@@ -45,13 +55,18 @@ jobs:
           ssh -i ~/.ssh/builder \
               -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=15 \
-              "root@${{ steps.params.outputs.target_ip }}" <<'EOF'
+              "root@${{ steps.params.outputs.target_ip }}" \
+              "JLINES='${{ inputs.journal_lines }}' JSINCE='${{ inputs.journal_since }}' JUNTIL='${{ inputs.journal_until }}' bash -s" <<'EOF'
           set -x
           hostname
           nixos-version
           nixos-version --configuration-revision || true
           systemctl is-active comin
-          journalctl -u comin --no-pager -n 30 || true
+          if [ -n "$JSINCE" ]; then
+            journalctl -u comin --no-pager --since "$JSINCE" ${JUNTIL:+--until "$JUNTIL"} || true
+          else
+            journalctl -u comin --no-pager -n "${JLINES:-30}" || true
+          fi
           nix --version
           df -h / /nix 2>/dev/null || df -h /
           EOF

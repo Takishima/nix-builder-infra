@@ -95,15 +95,68 @@ jobs:
           ip="${{ steps.params.outputs.ip }}"
           export NIX_SSHOPTS="-i $HOME/.ssh/builder -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
           log="$RUNNER_TEMP/postdeploy.log"
-          rc=0
+
+          # Coordinator state, captured over root SSH. Called WHILE the smoke
+          # build hangs (the wedge is only observable then: lock holder,
+          # listener and blocked daemon child all still exist) and again
+          # post-mortem on failure.
+          diagnose() {
+            ssh -i ~/.ssh/builder \
+                -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=15 "root@$ip" '
+              echo "== coordinator files =="
+              ls -la /nix/var/nix/coordinator* 2>&1 || true
+              echo "== flock probe (0=winnable, 1=held) =="
+              flock -n /nix/var/nix/coordinator.socket.lock true; echo "flock rc=$?"
+              echo "== unix listeners =="
+              ss -xlp 2>/dev/null | grep -i coordinator || echo "no coordinator listener"
+              echo "== nix processes =="
+              ps -eo pid,ppid,user,etime,wchan:30,args | grep -E "[n]ix" || true
+              echo "== daemon/coordinator kernel stacks =="
+              for p in $(pgrep -f "nix.*daemon|nix-daemon|build-coordinator" || true); do
+                echo "-- pid $p comm=$(cat /proc/$p/comm 2>/dev/null) wchan=$(cat /proc/$p/wchan 2>/dev/null)"
+                cat /proc/$p/stack 2>/dev/null || true
+              done
+            ' 2>&1 | sed "s/^/[$1] /" || true
+          }
+
           nix build -L --no-link \
             --store "$RUNNER_TEMP/client-store" --max-jobs 0 \
             --builders "ssh-ng://nixremote@$ip x86_64-linux - 2 1" \
             -f tests/remote-build-with-inputs.nix \
             --argstr prefix "postdeploy-${{ github.run_id }}" \
-            2> "$log" || rc=$?
+            2> "$log" &
+          build_pid=$!
+          start=$(date +%s)
+          rc=0
+          captured=0
+          # Healthy smokes finish in well under 2 min; past that we are in
+          # the wedge window (attach timeout + relay death takes minutes),
+          # so grab the builder state while the hang is live. Hard cap at
+          # 8 min: the historical wedge never recovers on its own.
+          while kill -0 "$build_pid" 2>/dev/null; do
+            elapsed=$(( $(date +%s) - start ))
+            if [ "$elapsed" -ge 120 ] && [ "$captured" -eq 0 ]; then
+              captured=1
+              echo "::warning::smoke build still running after ${elapsed}s; capturing coordinator state mid-hang"
+              diagnose wedge
+            fi
+            if [ "$elapsed" -ge 480 ]; then
+              echo "::error::smoke build wedged for ${elapsed}s; killing it"
+              kill "$build_pid" 2>/dev/null || true
+              break
+            fi
+            sleep 5
+          done
+          wait "$build_pid" || rc=$?
+          elapsed=$(( $(date +%s) - start ))
+          echo "smoke build: rc=$rc after ${elapsed}s"
           sed 's/^/[smoke] /' "$log"
-          [ "$rc" -eq 0 ] || { echo "::error::post-deploy smoke build failed"; exit 1; }
+          if [ "$rc" -ne 0 ]; then
+            [ "$captured" -eq 1 ] || diagnose post-mortem
+            echo "::error::post-deploy smoke build failed (rc=$rc after ${elapsed}s)"
+            exit 1
+          fi
           grep -q "INPUT:postdeploy-" "$log" \
             || { echo "::error::input content never streamed back"; exit 1; }
           echo "post-deploy verification passed"
