@@ -1,0 +1,3 @@
+# Bug reports for the nix fork are working documents handed to the fork
+# session out-of-band; they are deliberately not committed.
+bug-report-*.md
