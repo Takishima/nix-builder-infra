@@ -71,8 +71,11 @@ jobs:
                     # script inside the cmdline of the SSH session shell.
                     pkill -9 -f "nix-store [-]-serve" || true
                     rm -f /nix/var/nix/coordinator*.socket 2>/dev/null || true
+                    # Restore plain socket activation: an explicitly started
+                    # nix-daemon.service leaves the socket unit inactive,
+                    # which the protocol-tests preflight treats as unhealthy.
+                    systemctl stop nix-daemon.service || true
                     systemctl restart nix-daemon.socket
-                    systemctl restart nix-daemon.service || true
                     sleep 2
                     systemctl is-active nix-daemon.socket
                     ps -eo pid,ppid,etime,cmd | grep -v grep | grep -i nix || true
