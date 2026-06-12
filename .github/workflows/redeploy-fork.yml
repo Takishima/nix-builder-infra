@@ -126,6 +126,18 @@ jobs:
           ./result/bin/nix --version
           cachix push "${{ vars.CACHIX_CACHE_NAME }}" "$(readlink -f result)"
 
+      # The fork's own functional suite — including the eight
+      # build-coordinator tests — must pass before the rev is allowed to
+      # reach the fleet. doCheck=true in tests/functional/package.nix means
+      # building the attr IS running the suite; the component closures it
+      # depends on substitute from the nix-cli push above. A red here stops
+      # the bump: main keeps the old, working pin and the run fails loudly.
+      - name: Run the fork's functional test suite (gates the bump)
+        if: steps.head.outputs.changed == 'true'
+        run: |
+          nix build "github:${FORK_REPO}/${{ steps.pin.outputs.rev }}#nix-functional-tests" \
+            --print-build-logs --no-link
+
       # The system closure contains nix-cli plus everything that depends on
       # it; with this in the cache a bump deploy converges in a couple of
       # minutes instead of compiling nix dependents on the builder. One host

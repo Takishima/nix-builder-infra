@@ -1,0 +1,233 @@
+name: builder-churn-tests
+
+# Lifecycle stress for the build coordinator on a real builder — the two
+# scenarios that CANNOT be reproduced hermetically in the fork's functional
+# suite because they need real systemd activation and the real forwarded
+# ssh-ng topology:
+#
+#   switch-during-build   a NixOS generation switch (comin deploy of an empty
+#                         commit pushed by this workflow) lands while a
+#                         coordinated remote build is in flight. The historical
+#                         lock-stranding bug lived exactly here. The build must
+#                         complete successfully (a coordinator re-election or
+#                         build restart is acceptable and logged), and a fresh
+#                         unprivileged build right after the switch must
+#                         succeed promptly — the old wedge made it hang for
+#                         minutes and die with "daemon disconnected".
+#   coordinator-kill      SIGKILL the live coordinator process on the builder
+#                         while an unprivileged client's build is in flight.
+#                         The client must still end up with a successful build
+#                         (re-election; adopt or restart is informational) and
+#                         the daemon must stay healthy with no stranded
+#                         lock/socket.
+#
+# Both jobs probe /nix/var/nix/coordinator* lock state afterwards: the lock
+# must either be gone or held by a live process (flock-winnable + present =
+# stranded, the bug signature).
+#
+# The empty commit is pushed with GITHUB_TOKEN, which never triggers push
+# workflows — no post-deploy-verify noise, no recursion; this workflow does
+# its own post-switch verification. Avoid running this concurrently with
+# builder-protocol-tests or a pin bump: it deliberately churns the builder.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ip:
+        description: "Public IPv4 of the builder under test"
+        required: true
+      hold_seconds:
+        description: "How long the in-flight build holds (switch leg)"
+        required: false
+        default: "300"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: builder-churn-tests
+  cancel-in-progress: false
+
+jobs:
+  switch-during-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TARGET_IP: ${{ inputs.target_ip }}
+      HOLD: ${{ inputs.hold_seconds }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: ./.github/actions/setup-protocol-client
+        with:
+          client: fork
+          target-ip: ${{ env.TARGET_IP }}
+          ssh-private-key: ${{ secrets.BUILDER_SSH_PRIVATE_KEY }}
+
+      - name: Switch generations while a coordinated build is in flight
+        run: |
+          sshroot() {
+            ssh -i ~/.ssh/builder \
+                -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=15 "root@$TARGET_IP" "$@"
+          }
+          builders="ssh-ng://nixremote@$TARGET_IP x86_64-linux - 2 1"
+          tag="churnswitch-${{ github.run_id }}-$(date +%s)"
+          log="$RUNNER_TEMP/churn.log"
+
+          before=$(sshroot 'nixos-version --configuration-revision')
+          echo "pre-switch revision: $before"
+
+          # Long-holding build, verifiably in flight before we churn.
+          nix build -L --no-link \
+            --store "$RUNNER_TEMP/store-churn" --max-jobs 0 --builders "$builders" \
+            -f tests/remote-build.nix \
+            --argstr tag "$tag" --arg holdSeconds "$HOLD" \
+            > "$log" 2>&1 & pid=$!
+          for _ in $(seq 1 120); do
+            grep -q "MARKER:$tag" "$log" && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          grep -q "MARKER:$tag" "$log" \
+            || { sed 's/^/[churn] /' "$log"; echo "::error::build never got in flight"; exit 1; }
+          tok1=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$log" | head -n1)
+          echo "build in flight (token $tok1); pushing an empty commit to force a switch"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty \
+            -m "churn-test: empty commit to switch generations mid-build (run ${{ github.run_id }})"
+          git push origin main
+
+          # comin polls ~60s; a no-op generation builds in ~1 min. Wait for
+          # the deployed revision to CHANGE (not for an exact sha: a pin bump
+          # landing concurrently would converge past our commit).
+          switched=""
+          for i in $(seq 1 40); do
+            now=$(sshroot 'nixos-version --configuration-revision' || echo unreachable)
+            if [ "$now" != "$before" ] && [ "$now" != "unreachable" ]; then
+              switched=$now
+              break
+            fi
+            sleep 10
+          done
+          [ -n "$switched" ] \
+            || { echo "::error::builder never switched generations within the window"; kill "$pid" 2>/dev/null; exit 1; }
+          echo "switched to $switched while the build held"
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "::warning::build finished before the switch landed — the overlap assertion is vacuous this run; consider a larger hold_seconds"
+          fi
+
+          # The client build must come out whole, switch or no switch.
+          rc=0
+          wait "$pid" || rc=$?
+          sed 's/^/[churn] /' "$log"
+          [ "$rc" -eq 0 ] || { echo "::error::in-flight build failed across the generation switch"; exit 1; }
+          grep -q "DONE:$tag" "$log" \
+            || { echo "::error::build never streamed its completion"; exit 1; }
+          tok2=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$log" | tail -n1)
+          [ "$tok1" = "$tok2" ] \
+            && echo "build survived the switch in one execution (token $tok1)" \
+            || echo "::notice::build was restarted across the switch (tokens $tok1 -> $tok2) — acceptable, completion is the contract"
+
+          # The wedge probe: a fresh unprivileged build immediately after the
+          # switch. The historical failure mode hung here for minutes.
+          after="$RUNNER_TEMP/after-switch.log"
+          timeout 120 nix build -L --no-link \
+            --store "$RUNNER_TEMP/store-after" --max-jobs 0 --builders "$builders" \
+            -f tests/remote-build.nix \
+            --argstr prefix "afterswitch-${{ github.run_id }}" \
+            > "$after" 2>&1 \
+            || { sed 's/^/[after] /' "$after"; echo "::error::post-switch unprivileged build hung or failed — the wedge is back"; exit 1; }
+
+          echo "== coordinator lock state after the churn =="
+          sshroot 'ls -la /nix/var/nix/coordinator* 2>&1 || true;
+                   if [ -e /nix/var/nix/coordinator.socket.lock ]; then
+                     flock -n /nix/var/nix/coordinator.socket.lock true \
+                       && echo "::warning::lock file exists and is winnable — stranded lock signature" \
+                       || echo "lock held by a live coordinator (healthy)";
+                   else echo "no lock file (healthy)"; fi'
+          echo "switch-during-build OK"
+
+  coordinator-kill:
+    needs: switch-during-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TARGET_IP: ${{ inputs.target_ip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: ./.github/actions/setup-protocol-client
+        with:
+          client: fork
+          target-ip: ${{ env.TARGET_IP }}
+          ssh-private-key: ${{ secrets.BUILDER_SSH_PRIVATE_KEY }}
+
+      - name: SIGKILL the coordinator under a live unprivileged build
+        run: |
+          sshroot() {
+            ssh -i ~/.ssh/builder \
+                -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=15 "root@$TARGET_IP" "$@"
+          }
+          builders="ssh-ng://nixremote@$TARGET_IP x86_64-linux - 2 1"
+          tag="churnkill-${{ github.run_id }}-$(date +%s)"
+          log="$RUNNER_TEMP/kill.log"
+
+          nix build -L --no-link \
+            --store "$RUNNER_TEMP/store-kill" --max-jobs 0 --builders "$builders" \
+            -f tests/remote-build.nix \
+            --argstr tag "$tag" --arg holdSeconds 90 \
+            > "$log" 2>&1 & pid=$!
+          for _ in $(seq 1 60); do
+            grep -q "MARKER:$tag" "$log" && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          grep -q "MARKER:$tag" "$log" \
+            || { sed 's/^/[kill] /' "$log"; echo "::error::build never got in flight"; exit 1; }
+          tok1=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$log" | head -n1)
+
+          # The coordinator is whoever listens on the coordinator socket.
+          cpid=$(sshroot "ss -xlp 2>/dev/null | grep -F coordinator.socket | grep -oP 'pid=\\K[0-9]+' | head -n1" || true)
+          if [ -z "$cpid" ]; then
+            sshroot 'ss -xlp | head -50; ls -la /nix/var/nix/coordinator* 2>&1' || true
+            echo "::error::no coordinator listener found while a coordinated build is in flight"
+            kill "$pid" 2>/dev/null; exit 1
+          fi
+          echo "killing coordinator pid $cpid mid-build (token $tok1)"
+          sshroot "kill -9 $cpid"
+
+          # The client's contract: the build still completes successfully,
+          # via re-election (adopt or restart both acceptable, logged below).
+          rc=0
+          wait "$pid" || rc=$?
+          sed 's/^/[kill] /' "$log"
+          [ "$rc" -eq 0 ] || { echo "::error::build failed after coordinator SIGKILL — re-election did not recover it"; exit 1; }
+          grep -q "DONE:$tag" "$log" \
+            || { echo "::error::build never streamed its completion"; exit 1; }
+          tok2=$(sed -n 's/.*BUILDTOKEN:\([0-9.]*\).*/\1/p' "$log" | tail -n1)
+          [ "$tok1" = "$tok2" ] \
+            && echo "build adopted across the coordinator death (token $tok1)" \
+            || echo "::notice::build restarted after coordinator death (tokens $tok1 -> $tok2) — acceptable, completion is the contract"
+
+          # Daemon health + lock state afterwards.
+          after="$RUNNER_TEMP/after-kill.log"
+          timeout 120 nix build -L --no-link \
+            --store "$RUNNER_TEMP/store-after" --max-jobs 0 --builders "$builders" \
+            -f tests/remote-build.nix \
+            --argstr prefix "afterkill-${{ github.run_id }}" \
+            > "$after" 2>&1 \
+            || { sed 's/^/[after] /' "$after"; echo "::error::daemon unhealthy after coordinator SIGKILL"; exit 1; }
+          echo "== coordinator lock state after the kill =="
+          sshroot 'ls -la /nix/var/nix/coordinator* 2>&1 || true;
+                   if [ -e /nix/var/nix/coordinator.socket.lock ]; then
+                     flock -n /nix/var/nix/coordinator.socket.lock true \
+                       && echo "::warning::lock file exists and is winnable — stranded lock signature" \
+                       || echo "lock held by a live coordinator (healthy)";
+                   else echo "no lock file (healthy)"; fi'
+          echo "coordinator-kill OK"
