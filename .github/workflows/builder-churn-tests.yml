@@ -215,14 +215,41 @@ jobs:
             && echo "build adopted across the coordinator death (token $tok1)" \
             || echo "::notice::build restarted after coordinator death (tokens $tok1 -> $tok2) — acceptable, completion is the contract"
 
-          # Daemon health + lock state afterwards.
+          # Mid-hang capture of the coordinator/socket state, dumped BEFORE
+          # the post-kill build so that if re-election stalls (observed:
+          # the next coordinated build sat silent past the attach timeout
+          # after a hard kill) the evidence is in the log, not lost to the
+          # build's own timeout.
+          coorddiag() {
+            sshroot '
+              echo "== coordinator files =="; ls -la /nix/var/nix/coordinator* 2>&1 || true
+              echo "== flock probe (0=winnable, 1=held) =="
+              flock -n /nix/var/nix/coordinator.socket.lock true; echo "flock rc=$?"
+              echo "== unix listeners =="; ss -xlp 2>/dev/null | grep -i coordinator || echo "no coordinator listener"
+              echo "== nix processes =="; ps -eo pid,ppid,etime,wchan:24,args | grep -E "[n]ix|[c]oordinator" || true
+            ' 2>&1 | sed 's/^/[stall] /' || true
+          }
+
+          # A fresh coordinated build right after recovery: re-election must
+          # serve it promptly. Capture coordinator state at the 45s mark if
+          # it has not produced its first byte yet (the stall signature).
           after="$RUNNER_TEMP/after-kill.log"
-          timeout 120 nix build -L --no-link \
+          timeout 150 nix build -L --no-link \
             --store "$RUNNER_TEMP/store-after" --max-jobs 0 --builders "$builders" \
             -f tests/remote-build.nix \
             --argstr prefix "afterkill-${{ github.run_id }}" \
-            > "$after" 2>&1 \
-            || { sed 's/^/[after] /' "$after"; echo "::error::daemon unhealthy after coordinator SIGKILL"; exit 1; }
+            > "$after" 2>&1 & apid=$!
+          for _ in $(seq 1 9); do
+            kill -0 "$apid" 2>/dev/null || break
+            grep -q "BUILDTOKEN:" "$after" && break
+            sleep 5
+          done
+          if kill -0 "$apid" 2>/dev/null && ! grep -q "BUILDTOKEN:" "$after"; then
+            echo "::warning::post-kill build has produced no build token; capturing coordinator state mid-stall"
+            coorddiag stall
+          fi
+          arc=0; wait "$apid" || arc=$?
+          sed 's/^/[after] /' "$after"
           echo "== coordinator lock state after the kill =="
           sshroot 'ls -la /nix/var/nix/coordinator* 2>&1 || true;
                    if [ -e /nix/var/nix/coordinator.socket.lock ]; then
@@ -230,4 +257,6 @@ jobs:
                        && echo "::warning::lock file exists and is winnable — stranded lock signature" \
                        || echo "lock held by a live coordinator (healthy)";
                    else echo "no lock file (healthy)"; fi'
+          [ "$arc" -eq 0 ] \
+            || { echo "::error::post-kill coordinated build stalled/failed (rc=$arc) — re-election did not serve the next build promptly"; exit 1; }
           echo "coordinator-kill OK"
