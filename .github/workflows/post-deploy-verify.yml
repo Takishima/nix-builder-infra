@@ -93,7 +93,10 @@ jobs:
       - name: Smoke-build a derivation with a real input closure on the builder
         run: |
           ip="${{ steps.params.outputs.ip }}"
-          export NIX_SSHOPTS="-i $HOME/.ssh/builder -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
+          # ServerAlive* keepalives: a long-silent ssh-ng build emits no
+          # bytes, and the runner's Azure egress reaps idle outbound TCP
+          # after ~4 min, surfacing as "Nix daemon disconnected unexpectedly".
+          export NIX_SSHOPTS="-i $HOME/.ssh/builder -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
           log="$RUNNER_TEMP/postdeploy.log"
 
           # Coordinator state, captured over root SSH. Called WHILE the smoke

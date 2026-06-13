@@ -52,6 +52,14 @@ runs:
           User nixremote
           IdentityFile ~/.ssh/builder
           StrictHostKeyChecking accept-new
+          # ssh-ng streams the build log over this connection; a build that
+          # goes quiet emits zero bytes, and the GitHub runner's Azure egress
+          # reaps idle outbound TCP flows after ~4 min of SNAT inactivity —
+          # the next access then reads EOF and nix reports "Nix daemon
+          # disconnected unexpectedly". Keepalives keep the flow warm so a
+          # long-silent remote build survives.
+          ServerAliveInterval 30
+          ServerAliveCountMax 10
         EOF
         chmod 600 ~/.ssh/config
 
