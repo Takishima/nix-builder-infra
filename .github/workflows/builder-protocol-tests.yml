@@ -52,11 +52,8 @@ name: builder-protocol-tests
 #                      coordinator, and must not mask the other verdicts.
 #
 # Triggers: workflow_dispatch for humans; a push touching tests/request.json
-# for web sessions (whose scoped token cannot create dispatch events); and an
-# hourly soak cron — the concurrent/dedup stages are timing-sensitive, so one
-# green run proves little about probabilistic races; repetition on the real
-# fleet flushes them out. The cron reads its parameters from
-# tests/request.json like the push trigger does.
+# for web sessions (whose scoped token cannot create dispatch events). The
+# push trigger reads its parameters from tests/request.json.
 
 on:
   workflow_dispatch:
@@ -68,8 +65,6 @@ on:
         description: "How long the dedup-stage build stays in-flight"
         required: false
         default: "30"
-  schedule:
-    - cron: "41 * * * *"
   push:
     branches: [main]
     paths: ["tests/request.json"]

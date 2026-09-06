@@ -13,9 +13,6 @@ name: redeploy-fork
 # Triggers:
 #   - repository_dispatch (type nix-fork-push): per-commit, sent by a tiny
 #     notifier workflow in Takishima/nix (snippet in the README). Instant.
-#   - schedule: polling fallback every 10 minutes; needs no setup in the fork
-#     repo, no-ops in seconds when the pin already matches the branch head.
-#     (GitHub disables cron on repos with no activity for 60 days.)
 #   - workflow_dispatch for humans; push touching redeploy/request.json for
 #     web sessions (whose scoped token cannot create dispatch events).
 #
@@ -26,8 +23,6 @@ name: redeploy-fork
 on:
   repository_dispatch:
     types: [nix-fork-push]
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
   push:
     branches: [main]
